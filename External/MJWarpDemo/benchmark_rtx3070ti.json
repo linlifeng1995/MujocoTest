@@ -1,0 +1,28 @@
+{
+  "date": "2026-08-05",
+  "gpu": "NVIDIA GeForce RTX 3070 Ti",
+  "driver_cuda": "13.1",
+  "warp": "1.16.0",
+  "mujoco": "3.11.0",
+  "mujoco_warp": "3.11.0",
+  "physics_steps": 300,
+  "warmup_steps": 30,
+  "results": [
+    {
+      "nworld": 1,
+      "physics_steps_per_second": 2594
+    },
+    {
+      "nworld": 64,
+      "physics_steps_per_second": 137963
+    },
+    {
+      "nworld": 256,
+      "physics_steps_per_second": 477691
+    },
+    {
+      "nworld": 1024,
+      "physics_steps_per_second": 1574462
+    }
+  ]
+}
