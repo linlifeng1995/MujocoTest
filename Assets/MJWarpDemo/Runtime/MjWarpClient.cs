@@ -32,7 +32,7 @@ namespace MJWarpDemo
             {
                 DisposeSocket();
                 cancellationToken.ThrowIfCancellationRequested();
-                throw new TimeoutException($"Timed out connecting to MJWarp backend at {host}:{port}");
+                throw new TimeoutException($"连接 MJWarp 后端 {host}:{port} 超时");
             }
             await connectTask;
             stream = tcpClient.GetStream();
@@ -41,7 +41,7 @@ namespace MJWarpDemo
         public async Task<ResponseEnvelope> SendAsync(string messageType, object payload, CancellationToken cancellationToken)
         {
             if (!IsConnected)
-                throw new InvalidOperationException("MJWarp backend is not connected");
+                throw new InvalidOperationException("尚未连接 MJWarp 后端");
 
             await requestLock.WaitAsync(cancellationToken);
             try
@@ -56,7 +56,7 @@ namespace MJWarpDemo
 
                 byte[] json = Encoding.UTF8.GetBytes(JsonConvert.SerializeObject(message, Formatting.None));
                 if (json.Length > MaxMessageBytes)
-                    throw new InvalidOperationException($"Protocol message exceeds {MaxMessageBytes} bytes");
+                    throw new InvalidOperationException($"协议消息超过大小上限：{MaxMessageBytes} 字节");
                 byte[] header = BitConverter.GetBytes(json.Length);
                 await stream.WriteAsync(header, 0, header.Length, cancellationToken);
                 await stream.WriteAsync(json, 0, json.Length, cancellationToken);
@@ -66,16 +66,16 @@ namespace MJWarpDemo
                 await ReadExactAsync(responseHeader, cancellationToken);
                 int responseLength = BitConverter.ToInt32(responseHeader, 0);
                 if (responseLength <= 0 || responseLength > MaxMessageBytes)
-                    throw new InvalidDataException($"Invalid response length: {responseLength}");
+                    throw new InvalidDataException($"后端响应长度无效：{responseLength}");
                 byte[] responseBytes = new byte[responseLength];
                 await ReadExactAsync(responseBytes, cancellationToken);
                 ResponseEnvelope response = JsonConvert.DeserializeObject<ResponseEnvelope>(Encoding.UTF8.GetString(responseBytes));
                 if (response == null)
-                    throw new InvalidDataException("Backend returned an empty JSON response");
+                    throw new InvalidDataException("后端返回了空 JSON 响应");
                 if (response.request_id != requestId)
-                    throw new InvalidDataException($"Response request id mismatch: {response.request_id} != {requestId}");
+                    throw new InvalidDataException($"响应请求 ID 不匹配：{response.request_id} != {requestId}");
                 if (response.type == "error")
-                    throw new InvalidOperationException(response.error ?? "Unknown MJWarp backend error");
+                    throw new InvalidOperationException(response.error == null ? "未知的 MJWarp 后端错误" : $"MJWarp 后端错误：{response.error}");
                 return response;
             }
             finally
@@ -91,7 +91,7 @@ namespace MJWarpDemo
             {
                 int read = await stream.ReadAsync(buffer, offset, buffer.Length - offset, cancellationToken);
                 if (read == 0)
-                    throw new EndOfStreamException("MJWarp backend closed the connection");
+                    throw new EndOfStreamException("MJWarp 后端已关闭连接");
                 offset += read;
             }
         }

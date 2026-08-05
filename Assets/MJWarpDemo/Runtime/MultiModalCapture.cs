@@ -41,7 +41,7 @@ namespace MJWarpDemo
 
             Shader depthShader = Shader.Find("MJWarp/LinearDepth");
             if (depthShader == null)
-                throw new InvalidOperationException("Missing shader MJWarp/LinearDepth");
+                throw new InvalidOperationException("缺少 MJWarp/LinearDepth 深度采集 Shader");
             depthMaterial = new Material(depthShader) { name = "MJWarp Linear Depth Material" };
         }
 
@@ -103,7 +103,7 @@ namespace MJWarpDemo
             {
                 if (request.hasError)
                 {
-                    completion.TrySetException(new InvalidOperationException($"GPU readback failed for {texture.name}"));
+                    completion.TrySetException(new InvalidOperationException($"GPU 回读失败：{texture.name}"));
                     return;
                 }
                 var native = request.GetData<byte>();

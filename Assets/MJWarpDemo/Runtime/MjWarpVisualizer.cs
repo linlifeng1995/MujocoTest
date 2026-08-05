@@ -129,7 +129,7 @@ namespace MJWarpDemo
         {
             Shader shader = Shader.Find("MJWarp/InstanceId");
             if (shader == null)
-                throw new InvalidOperationException("Missing shader MJWarp/InstanceId");
+                throw new InvalidOperationException("缺少 MJWarp/InstanceId 实例分割 Shader");
             var material = new Material(shader) { name = $"Instance {instanceId}" };
             // Use a Vector property, not a Color property: Unity color-space conversion
             // would otherwise quantize small IDs such as 1/255 back to zero.

@@ -27,10 +27,11 @@ namespace MJWarpDemo
         private Process backendProcess;
         private Camera mainCamera;
         private Light keyLight;
+        private Font chineseFont;
         private StateData currentState;
         private BackendInfo backendInfo;
         private BenchmarkResult[] benchmarkResults;
-        private string status = "Starting";
+        private string status = "正在启动";
         private string selectedPolicy = "expert";
         private string seedText = "0";
         private string lastDatasetPath = "";
@@ -89,6 +90,13 @@ namespace MJWarpDemo
             keyLight.intensity = 1.25f;
             keyLight.transform.rotation = Quaternion.Euler(48f, -32f, 0f);
             RenderSettings.ambientIntensity = 0.75f;
+
+            string[] preferredFonts = { "Microsoft YaHei UI", "Microsoft YaHei", "SimHei" };
+            string[] installedFonts = Font.GetOSInstalledFontNames();
+            string selectedFont = preferredFonts.FirstOrDefault(candidate =>
+                installedFonts.Any(installed => string.Equals(installed, candidate, StringComparison.OrdinalIgnoreCase)));
+            if (!string.IsNullOrEmpty(selectedFont))
+                chineseFont = Font.CreateDynamicFontFromOSFont(selectedFont, 16);
         }
 
         private async Task ConnectBackendAsync()
@@ -98,7 +106,7 @@ namespace MJWarpDemo
             busy = true;
             try
             {
-                status = "Connecting to MJWarp backend...";
+                status = "正在连接 MJWarp 后端……";
                 try
                 {
                     await client.ConnectAsync(Host, Port, 800, lifetimeCancellation.Token);
@@ -119,11 +127,11 @@ namespace MJWarpDemo
                         catch (Exception exception)
                         {
                             lastError = exception;
-                            status = $"Waiting for CUDA backend... {attempt / 2 + 1}s";
+                            status = $"正在等待 CUDA 后端……{attempt / 2 + 1} 秒";
                         }
                     }
                     if (!client.IsConnected)
-                        throw new InvalidOperationException("MJWarp backend did not become ready", lastError);
+                        throw new InvalidOperationException("MJWarp 后端未能就绪", lastError);
                 }
 
                 ResponseEnvelope hello = await client.SendAsync("hello", new { client = "Unity", unity_version = Application.unityVersion }, lifetimeCancellation.Token);
@@ -134,7 +142,7 @@ namespace MJWarpDemo
                 currentState = reset.state;
                 visualizer.ApplyState(currentState);
                 RandomizeScene(CurrentSeed);
-                status = "Ready";
+                status = "就绪";
             }
             finally
             {
@@ -147,11 +155,11 @@ namespace MJWarpDemo
             if (backendProcess != null && !backendProcess.HasExited)
                 return;
             string projectRoot = Directory.GetParent(Application.dataPath)?.FullName
-                ?? throw new InvalidOperationException("Cannot resolve Unity project root");
+                ?? throw new InvalidOperationException("无法确定 Unity 工程根目录");
             string backendRoot = Path.Combine(projectRoot, "External", "MJWarpDemo");
             string python = Path.Combine(backendRoot, ".venv", "Scripts", "python.exe");
             if (!File.Exists(python))
-                throw new FileNotFoundException("Project Python environment is missing. Run `uv sync --python 3.12` in External/MJWarpDemo.", python);
+                throw new FileNotFoundException("缺少项目 Python 环境。请在 External/MJWarpDemo 中运行 `uv sync --python 3.12`。", python);
 
             var startInfo = new ProcessStartInfo
             {
@@ -166,9 +174,9 @@ namespace MJWarpDemo
             backendProcess = new Process { StartInfo = startInfo, EnableRaisingEvents = true };
             backendProcess.OutputDataReceived += (_, args) => EnqueueBackendLog(args.Data);
             backendProcess.ErrorDataReceived += (_, args) => EnqueueBackendLog(args.Data);
-            backendProcess.Exited += (_, __) => EnqueueBackendLog($"Backend exited with code {backendProcess.ExitCode}");
+            backendProcess.Exited += (_, __) => EnqueueBackendLog($"后端进程已退出，退出码：{backendProcess.ExitCode}");
             if (!backendProcess.Start())
-                throw new InvalidOperationException("Failed to start MJWarp backend process");
+                throw new InvalidOperationException("启动 MJWarp 后端进程失败");
             backendProcess.BeginOutputReadLine();
             backendProcess.BeginErrorReadLine();
         }
@@ -210,7 +218,7 @@ namespace MJWarpDemo
         {
             if (!client.IsConnected)
                 await ConnectBackendAsync();
-            status = $"Resetting {policy} episode (seed {seed})";
+            status = $"正在重置{PolicyDisplayName(policy)}回合（随机种子 {seed}）";
             ResponseEnvelope reset = await client.SendAsync("reset", new { seed, policy, nworld = 1 }, lifetimeCancellation.Token);
             currentState = reset.state;
             visualizer.ApplyState(currentState);
@@ -225,7 +233,7 @@ namespace MJWarpDemo
                     new { seed, policy, image_width = MultiModalCapture.Width, image_height = MultiModalCapture.Height },
                     lifetimeCancellation.Token);
                 recordingStarted = true;
-                status = $"Recording {started.episode_id}";
+                status = $"正在录制：{started.episode_id}";
             }
 
             try
@@ -251,7 +259,7 @@ namespace MJWarpDemo
                             },
                             lifetimeCancellation.Token);
                     }
-                    status = $"{policy} | frame {currentState.frame_id}/120 | reward {currentState.reward:F3}";
+                    status = $"{PolicyDisplayName(policy)}｜帧 {currentState.frame_id}/120｜奖励 {currentState.reward:F3}";
                 }
             }
             finally
@@ -262,20 +270,20 @@ namespace MJWarpDemo
                     lastDatasetPath = stopped.path;
                 }
             }
-            status = $"Episode complete: success={currentState.success}, frames={currentState.frame_id}";
+            status = $"回合完成：成功={YesNo(currentState.success)}，帧数={currentState.frame_id}";
         }
 
         private async void RunBenchmark()
         {
             await RunOperation(async () =>
             {
-                status = "Benchmarking 1/64/256/1024 worlds...";
+                status = "正在测试 1/64/256/1024 个并行环境……";
                 ResponseEnvelope result = await client.SendAsync(
                     "benchmark",
                     new { sizes = new[] { 1, 64, 256, 1024 }, steps = 300, warmup = 30 },
                     lifetimeCancellation.Token);
                 benchmarkResults = result.results;
-                status = "Benchmark complete";
+                status = "GPU 性能测试完成";
             });
         }
 
@@ -291,7 +299,7 @@ namespace MJWarpDemo
             }
             catch (OperationCanceledException) when (lifetimeCancellation.IsCancellationRequested)
             {
-                status = "Stopped";
+                status = "已停止";
             }
             catch (Exception exception)
             {
@@ -321,71 +329,73 @@ namespace MJWarpDemo
 
         private void SetError(Exception exception)
         {
-            status = $"ERROR: {exception.GetBaseException().Message}";
+            status = $"错误：{exception.GetBaseException().Message}";
             Debug.LogException(exception);
         }
 
         private void OnGUI()
         {
+            if (chineseFont != null)
+                GUI.skin.font = chineseFont;
             const float panelWidth = 390f;
             GUILayout.BeginArea(new Rect(12f, 12f, panelWidth, Screen.height - 24f), GUI.skin.box);
-            GUILayout.Label("MJWarp × Unity Embodied Data Demo", HeaderStyle());
-            GUILayout.Label($"Status: {status}");
+            GUILayout.Label("MJWarp × Unity 具身训练数据演示", HeaderStyle());
+            GUILayout.Label($"状态：{status}");
             GUILayout.Label(backendInfo == null
-                ? "Backend: not connected"
-                : $"Backend: MuJoCo/MJWarp {backendInfo.mujoco_warp_version} | {backendInfo.gpu}");
+                ? "后端：未连接"
+                : $"后端：MuJoCo/MJWarp {backendInfo.mujoco_warp_version}｜{backendInfo.gpu}");
 
             GUILayout.Space(6f);
             GUILayout.BeginHorizontal();
-            GUILayout.Label("Seed", GUILayout.Width(42f));
+            GUILayout.Label("随机种子", GUILayout.Width(68f));
             seedText = GUILayout.TextField(seedText, GUILayout.Width(90f));
             GUI.enabled = !busy;
-            if (GUILayout.Button("Expert")) selectedPolicy = "expert";
-            if (GUILayout.Button("Random")) selectedPolicy = "random";
+            if (GUILayout.Button("专家策略")) selectedPolicy = "expert";
+            if (GUILayout.Button("随机策略")) selectedPolicy = "random";
             GUI.enabled = true;
             GUILayout.EndHorizontal();
-            GUILayout.Label($"Policy: {selectedPolicy}");
-            recordEpisode = GUILayout.Toggle(recordEpisode, "Record aligned HDF5 episode");
+            GUILayout.Label($"当前策略：{PolicyDisplayName(selectedPolicy)}");
+            recordEpisode = GUILayout.Toggle(recordEpisode, "录制严格对齐的 HDF5 回合数据");
 
             GUILayout.BeginHorizontal();
             GUI.enabled = !busy && client != null && client.IsConnected;
-            if (GUILayout.Button("Run Episode")) RunSingleEpisode();
-            if (GUILayout.Button("Generate 20")) GenerateAcceptanceSet();
+            if (GUILayout.Button("运行单回合")) RunSingleEpisode();
+            if (GUILayout.Button("生成 20 回合")) GenerateAcceptanceSet();
             GUI.enabled = busy;
-            if (GUILayout.Button("Stop")) stopRequested = true;
+            if (GUILayout.Button("停止")) stopRequested = true;
             GUI.enabled = true;
             GUILayout.EndHorizontal();
 
             GUILayout.BeginHorizontal();
             GUI.enabled = !busy;
-            if (GUILayout.Button("Connect / Retry")) _ = ConnectBackendAsync();
+            if (GUILayout.Button("连接 / 重试")) _ = ConnectBackendAsync();
             GUI.enabled = !busy && client != null && client.IsConnected;
-            if (GUILayout.Button("GPU Benchmark")) RunBenchmark();
+            if (GUILayout.Button("GPU 性能测试")) RunBenchmark();
             GUI.enabled = true;
             GUILayout.EndHorizontal();
 
             if (currentState != null)
             {
                 GUILayout.Space(6f);
-                GUILayout.Label($"Frame {currentState.frame_id} | sim {currentState.sim_time:F3}s");
-                GUILayout.Label($"Reward {currentState.reward:F4} | contacts {currentState.contacts?.count ?? 0}");
-                GUILayout.Label($"Success {currentState.success} | terminated {currentState.terminated}");
+                GUILayout.Label($"帧 {currentState.frame_id}｜仿真时间 {currentState.sim_time:F3} 秒");
+                GUILayout.Label($"奖励 {currentState.reward:F4}｜接触数 {currentState.contacts?.count ?? 0}");
+                GUILayout.Label($"成功 {YesNo(currentState.success)}｜已结束 {YesNo(currentState.terminated)}");
                 if (currentState.metrics != null)
-                    GUILayout.Label($"Interactive physics: {currentState.metrics.physics_steps_per_second:F0} steps/s");
+                    GUILayout.Label($"交互物理吞吐：{currentState.metrics.physics_steps_per_second:F0} 步/秒");
             }
 
             if (!string.IsNullOrEmpty(lastDatasetPath))
-                GUILayout.Label($"Last HDF5: {lastDatasetPath}");
+                GUILayout.Label($"最近生成的 HDF5：{lastDatasetPath}");
 
             if (benchmarkResults != null)
             {
                 GUILayout.Space(6f);
-                GUILayout.Label("CUDA graph benchmark");
+                GUILayout.Label("CUDA Graph 性能测试");
                 foreach (BenchmarkResult item in benchmarkResults)
                 {
                     string value = string.IsNullOrEmpty(item.error)
-                        ? $"{item.actual_nworld,4} worlds: {item.physics_steps_per_second,12:N0} steps/s{(item.fallback ? " (fallback)" : "") }"
-                        : $"{item.requested_nworld,4} worlds: ERROR {item.error}";
+                        ? $"{item.actual_nworld,4} 个环境：{item.physics_steps_per_second,12:N0} 步/秒{(item.fallback ? "（已降级）" : "") }"
+                        : $"{item.requested_nworld,4} 个环境：错误 {item.error}";
                     GUILayout.Label(value);
                 }
             }
@@ -393,7 +403,7 @@ namespace MJWarpDemo
             if (capture != null)
             {
                 GUILayout.Space(6f);
-                GUILayout.Label("RGB / Linear depth / Instance ID");
+                GUILayout.Label("RGB / 线性深度 / 实例 ID");
                 float previewWidth = (panelWidth - 34f) / 3f;
                 Rect row = GUILayoutUtility.GetRect(panelWidth - 20f, previewWidth * 0.75f);
                 GUI.DrawTexture(new Rect(row.x, row.y, previewWidth, row.height), capture.RgbTexture, ScaleMode.ScaleToFit, false);
@@ -402,7 +412,7 @@ namespace MJWarpDemo
             }
 
             GUILayout.Space(6f);
-            GUILayout.Label("Backend log", GUILayout.ExpandWidth(true));
+            GUILayout.Label("后端日志", GUILayout.ExpandWidth(true));
             logScroll = GUILayout.BeginScrollView(logScroll, GUILayout.Height(120f));
             GUILayout.Label(backendLog.ToString());
             GUILayout.EndScrollView();
@@ -419,9 +429,21 @@ namespace MJWarpDemo
             return style;
         }
 
+        private static string PolicyDisplayName(string policy)
+        {
+            return policy == "expert" ? "专家策略" : "随机策略";
+        }
+
+        private static string YesNo(bool value)
+        {
+            return value ? "是" : "否";
+        }
+
         private void OnDestroy()
         {
             lifetimeCancellation.Cancel();
+            if (chineseFont != null)
+                Destroy(chineseFont);
             capture?.Dispose();
             visualizer.Dispose();
             client?.Dispose();
