@@ -15,32 +15,47 @@ import warp as wp
 
 from .protocol import PROTOCOL_VERSION, read_message, response, write_message
 from .recorder import EpisodeRecorder, IMAGE_HEIGHT, IMAGE_WIDTH
-from .task import PlanarPushTask, benchmark_sizes
+from .scenarios import DEFAULT_SCENARIO_ID, SCENARIOS, get_scenario, scenario_summaries
+from .task import EmbodiedTask, benchmark_sizes, create_task
 
 LOGGER = logging.getLogger("mjwarp_demo")
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 UNITY_ROOT = Path(__file__).resolve().parents[3]
-DEFAULT_MODEL = PACKAGE_ROOT / "model" / "planar_push.xml"
 DEFAULT_DATASETS = UNITY_ROOT / "Datasets"
 
 
 class DemoServer:
-    def __init__(self, model_path: Path, dataset_dir: Path, device: str) -> None:
-        self.model_path = model_path
+    def __init__(
+        self,
+        model_path: Path | None,
+        dataset_dir: Path,
+        device: str,
+        default_scenario: str = DEFAULT_SCENARIO_ID,
+    ) -> None:
+        self.model_override = model_path
         self.dataset_dir = dataset_dir
         self.device = device
-        self.task: PlanarPushTask | None = None
+        self.default_scenario = get_scenario(default_scenario).scenario_id
+        self.task: EmbodiedTask | None = None
         self.recorder: EpisodeRecorder | None = None
         self.pending_state: dict[str, Any] | None = None
         self.shutdown_event = asyncio.Event()
 
-    def ensure_task(self, nworld: int = 1) -> PlanarPushTask:
-        if self.task is None or self.task.nworld != nworld:
+    def ensure_task(self, nworld: int = 1, scenario_id: str | None = None) -> EmbodiedTask:
+        requested_scenario = get_scenario(scenario_id or self.default_scenario).scenario_id
+        if self.task is None or self.task.nworld != nworld or self.task.task_name != requested_scenario:
             if self.recorder is not None:
                 self.recorder.abort("physics task was replaced while recording")
                 self.recorder = None
             self.pending_state = None
-            self.task = PlanarPushTask(self.model_path, nworld=nworld, device=self.device)
+            model_override = self.model_override if requested_scenario == self.default_scenario else None
+            self.task = create_task(
+                requested_scenario,
+                PACKAGE_ROOT,
+                nworld=nworld,
+                device=self.device,
+                model_override=model_override,
+            )
         return self.task
 
     async def handle(self, message: dict[str, Any]) -> dict[str, Any]:
@@ -51,7 +66,8 @@ class DemoServer:
         message_type = str(message.get("type", ""))
 
         if message_type == "hello":
-            task = self.ensure_task(1)
+            scenario_id = str(message.get("scenario", self.default_scenario))
+            task = self.ensure_task(1, scenario_id)
             return response(
                 "hello",
                 request_id,
@@ -63,6 +79,7 @@ class DemoServer:
                     "gpu": task.gpu_name,
                 },
                 model_spec=task.model_spec(),
+                scenarios=scenario_summaries(),
             )
 
         if message_type == "reset":
@@ -73,12 +90,14 @@ class DemoServer:
                 self.recorder.abort("reset occurred before record_stop")
                 self.recorder = None
             self.pending_state = None
-            task = self.ensure_task(nworld)
+            scenario_id = str(message.get("scenario", self.task.task_name if self.task else self.default_scenario))
+            task = self.ensure_task(nworld, scenario_id)
             state = task.reset(seed=int(message.get("seed", 0)), policy=str(message.get("policy", "expert")))
             return response("reset", request_id, state=state)
 
         if message_type == "record_start":
-            task = self.ensure_task(1)
+            scenario_id = str(message.get("scenario", self.task.task_name if self.task else self.default_scenario))
+            task = self.ensure_task(1, scenario_id)
             if self.recorder is not None:
                 raise RuntimeError("a recording is already active")
             policy = str(message.get("policy", task.policy))
@@ -86,13 +105,17 @@ class DemoServer:
             episode_id = str(
                 message.get(
                     "episode_id",
-                    f"{datetime.now():%Y%m%d_%H%M%S}_{policy}_seed{seed}_{uuid.uuid4().hex[:6]}",
+                    f"{datetime.now():%Y%m%d_%H%M%S}_{task.task_name}_{policy}_seed{seed}_{uuid.uuid4().hex[:6]}",
                 )
             )
             self.recorder = EpisodeRecorder(
                 self.dataset_dir,
                 episode_id,
                 {
+                    "task_name": task.task_name,
+                    "task_display_name": task.definition.display_name,
+                    "business_type": task.definition.business_type,
+                    "official_reference": task.definition.official_reference,
                     "seed": seed,
                     "policy": policy,
                     "physics_dt": float(task.mj_model.opt.timestep),
@@ -109,7 +132,8 @@ class DemoServer:
             return response("record_start", request_id, episode_id=episode_id)
 
         if message_type == "step":
-            task = self.ensure_task(int(message.get("nworld", 1)))
+            scenario_id = str(message.get("scenario", self.task.task_name if self.task else self.default_scenario))
+            task = self.ensure_task(int(message.get("nworld", 1)), scenario_id)
             if self.recorder is not None and self.pending_state is not None:
                 raise RuntimeError("previous physics frame has not received a matching capture")
             state = task.step(message.get("action"))
@@ -148,14 +172,16 @@ class DemoServer:
 
         if message_type == "benchmark":
             sizes = [int(value) for value in message.get("sizes", [1, 64, 256, 1024])]
+            scenario_id = str(message.get("scenario", self.task.task_name if self.task else self.default_scenario))
+            task = self.ensure_task(1, scenario_id)
             results = benchmark_sizes(
-                self.model_path,
+                task.model_path,
                 sizes=sizes,
                 steps=int(message.get("steps", 300)),
                 warmup=int(message.get("warmup", 30)),
                 device=self.device,
             )
-            return response("benchmark", request_id, gpu=self.ensure_task(1).gpu_name, results=results)
+            return response("benchmark", request_id, gpu=task.gpu_name, results=results)
 
         if message_type == "shutdown":
             if self.recorder is not None:
@@ -192,7 +218,7 @@ class DemoServer:
 
 
 async def run_server(args: argparse.Namespace) -> None:
-    demo = DemoServer(args.model, args.dataset_dir, args.device)
+    demo = DemoServer(args.model, args.dataset_dir, args.device, args.scenario)
     server = await asyncio.start_server(demo.client_connected, args.host, args.port)
     addresses = ", ".join(str(sock.getsockname()) for sock in server.sockets or [])
     print(f"MJWARP_DEMO_READY {addresses}", flush=True)
@@ -211,7 +237,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--device", default="cuda:0")
-    parser.add_argument("--model", type=Path, default=DEFAULT_MODEL)
+    parser.add_argument("--scenario", choices=sorted(SCENARIOS), default=DEFAULT_SCENARIO_ID)
+    parser.add_argument("--model", type=Path, default=None, help="optional model override for the default scenario")
     parser.add_argument("--dataset-dir", type=Path, default=DEFAULT_DATASETS)
     parser.add_argument("--log-level", default="INFO")
     return parser.parse_args()

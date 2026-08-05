@@ -4,15 +4,18 @@ import argparse
 import time
 from pathlib import Path
 
-from .task import PlanarPushTask
+from .scenarios import DEFAULT_SCENARIO_ID, SCENARIOS
+from .task import create_task
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Evaluate expert and random policies")
     parser.add_argument("--episodes", type=int, default=10)
-    parser.add_argument("--model", type=Path, default=Path(__file__).resolve().parents[1] / "model" / "planar_push.xml")
+    parser.add_argument("--scenario", choices=sorted(SCENARIOS), default=DEFAULT_SCENARIO_ID)
+    parser.add_argument("--model", type=Path, default=None)
     args = parser.parse_args()
-    task = PlanarPushTask(args.model, nworld=1)
+    package_root = Path(__file__).resolve().parents[1]
+    task = create_task(args.scenario, package_root, nworld=1, model_override=args.model)
     started = time.perf_counter()
     for policy in ("expert", "random"):
         wins = 0

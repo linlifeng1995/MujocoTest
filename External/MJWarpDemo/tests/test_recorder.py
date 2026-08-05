@@ -17,6 +17,9 @@ def _state(frame_id: int) -> dict:
         "body_position": [[0.0, 0.0, 0.0]] * 6,
         "body_quaternion": [[1.0, 0.0, 0.0, 0.0]] * 6,
         "body_external_wrench": [[0.0] * 6] * 6,
+        "goal_position": [0.2, 0.0, 0.0],
+        "task_stage": 1,
+        "distance_to_goal": 0.12,
         "action": [0.1, -0.1],
         "reward": 0.25,
         "terminated": False,
@@ -43,10 +46,19 @@ def test_recorder_writes_valid_aligned_episode(tmp_path: Path) -> None:
         "depth_b64": base64.b64encode(depth.tobytes()).decode(),
         "instance_b64": base64.b64encode(rgba.tobytes()).decode(),
     }
-    recorder = EpisodeRecorder(tmp_path, "episode", {"seed": 1, "policy": "expert"}, width, height)
+    recorder = EpisodeRecorder(
+        tmp_path,
+        "episode",
+        {"task_name": "precision_insert", "seed": 1, "policy": "expert"},
+        width,
+        height,
+    )
     recorder.append_capture(_state(1), capture)
     path = recorder.close(False)
     assert validate_file(path) == []
     with h5py.File(path, "r") as episode:
         assert episode["images/rgb"].shape == (1, height, width, 3)
+        assert episode["observations/goal_position"].shape == (1, 3)
+        assert episode.attrs["schema_version"] == "1.1"
+        assert episode.attrs["task_name"] == "precision_insert"
         assert episode.attrs["frame_count"] == 1

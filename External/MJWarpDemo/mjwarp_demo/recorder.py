@@ -11,7 +11,7 @@ import numpy as np
 IMAGE_HEIGHT = 240
 IMAGE_WIDTH = 320
 MAX_CONTACTS = 16
-SCHEMA_VERSION = "1.0"
+SCHEMA_VERSION = "1.1"
 
 
 class EpisodeRecorder:
@@ -38,12 +38,13 @@ class EpisodeRecorder:
 
         attrs = {
             "schema_version": SCHEMA_VERSION,
-            "task_name": "planar_push",
+            "task_name": metadata.get("task_name", "planar_push"),
             "episode_id": episode_id,
             "image_width": image_width,
             "image_height": image_height,
             "coordinate_system_physics": "MuJoCo right-handed Z-up",
             "coordinate_system_render": "Unity left-handed Y-up",
+            "transition_semantics": "row t stores post-action observation and action that produced it",
             **metadata,
         }
         for key, value in attrs.items():
@@ -90,6 +91,9 @@ class EpisodeRecorder:
         self._append("observations/body_position", state["body_position"], dtype=np.float32)
         self._append("observations/body_quaternion", state["body_quaternion"], dtype=np.float32)
         self._append("observations/body_external_wrench", state["body_external_wrench"], dtype=np.float32)
+        self._append("observations/goal_position", state["goal_position"], dtype=np.float32)
+        self._append("observations/task_stage", state.get("task_stage", 0), dtype=np.int16)
+        self._append("observations/distance_to_goal", state.get("distance_to_goal", 0.0), dtype=np.float32)
         self._append("actions", state["action"], dtype=np.float32)
         self._append("rewards", state["reward"], dtype=np.float32)
         self._append("terminated", state["terminated"], dtype=np.bool_)

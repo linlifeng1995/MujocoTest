@@ -19,6 +19,7 @@ namespace MJWarpDemo
         public bool stopped;
         public int frame_count;
         public BenchmarkResult[] results;
+        public ScenarioSummary[] scenarios;
     }
 
     [Serializable]
@@ -35,11 +36,28 @@ namespace MJWarpDemo
     public sealed class ModelSpec
     {
         public string name;
+        public string scenario_id;
+        public string display_name;
+        public string business_type;
+        public string description;
+        public string official_reference;
         public float physics_dt;
         public float control_dt;
         public int max_frames;
+        public float goal_radius;
+        public float[] camera_position;
+        public float[] camera_look_at;
         public BodySpec[] bodies;
         public GeomSpec[] geoms;
+    }
+
+    [Serializable]
+    public sealed class ScenarioSummary
+    {
+        public string scenario_id;
+        public string display_name;
+        public string business_type;
+        public string description;
     }
 
     [Serializable]
@@ -67,6 +85,7 @@ namespace MJWarpDemo
     {
         public int frame_id;
         public double sim_time;
+        public string scenario_id;
         public float[] qpos;
         public float[] qvel;
         public float[][] body_position;
@@ -77,6 +96,8 @@ namespace MJWarpDemo
         public bool terminated;
         public bool success;
         public float[] goal_position;
+        public int task_stage;
+        public float distance_to_goal;
         public ContactData contacts;
         public MetricsData metrics;
     }

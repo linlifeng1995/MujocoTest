@@ -7,6 +7,7 @@ using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using UnityEngine;
+using UnityEngine.SceneManagement;
 using Debug = UnityEngine.Debug;
 
 namespace MJWarpDemo
@@ -28,6 +29,8 @@ namespace MJWarpDemo
         private Camera mainCamera;
         private Light keyLight;
         private Font chineseFont;
+        private MjWarpScenarioInfo scenario;
+        private ModelSpec modelSpec;
         private StateData currentState;
         private BackendInfo backendInfo;
         private BenchmarkResult[] benchmarkResults;
@@ -39,6 +42,8 @@ namespace MJWarpDemo
         private bool busy;
         private bool stopRequested;
         private Vector2 logScroll;
+        private Vector3 baseCameraPosition = new Vector3(-0.02f, 0.86f, -0.88f);
+        private Vector3 baseCameraLookAt = new Vector3(-0.04f, 0.035f, 0f);
 
         [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.AfterSceneLoad)]
         private static void Bootstrap()
@@ -54,6 +59,7 @@ namespace MJWarpDemo
 
         private async void Start()
         {
+            scenario = MjWarpScenarioCatalog.Active;
             ConfigureScene();
             client = new MjWarpClient();
             try
@@ -75,8 +81,8 @@ namespace MJWarpDemo
                 var cameraObject = new GameObject("Main Camera") { tag = "MainCamera" };
                 mainCamera = cameraObject.AddComponent<Camera>();
             }
-            mainCamera.transform.position = new Vector3(-0.02f, 0.86f, -0.88f);
-            mainCamera.transform.LookAt(new Vector3(-0.04f, 0.035f, 0f));
+            mainCamera.transform.position = baseCameraPosition;
+            mainCamera.transform.LookAt(baseCameraLookAt);
             mainCamera.fieldOfView = 48f;
             mainCamera.nearClipPlane = 0.03f;
             mainCamera.farClipPlane = 4f;
@@ -134,11 +140,20 @@ namespace MJWarpDemo
                         throw new InvalidOperationException("MJWarp 后端未能就绪", lastError);
                 }
 
-                ResponseEnvelope hello = await client.SendAsync("hello", new { client = "Unity", unity_version = Application.unityVersion }, lifetimeCancellation.Token);
+                ResponseEnvelope hello = await client.SendAsync(
+                    "hello",
+                    new { client = "Unity", unity_version = Application.unityVersion, scenario = scenario.ScenarioId },
+                    lifetimeCancellation.Token);
                 backendInfo = hello.backend;
-                visualizer.Build(hello.model_spec);
+                modelSpec = hello.model_spec;
+                scenario = MjWarpScenarioCatalog.FindById(modelSpec.scenario_id);
+                ApplyModelPresentation(modelSpec);
+                visualizer.Build(modelSpec);
                 capture.SetBindings(visualizer.RendererBindings);
-                ResponseEnvelope reset = await client.SendAsync("reset", new { seed = CurrentSeed, policy = selectedPolicy, nworld = 1 }, lifetimeCancellation.Token);
+                ResponseEnvelope reset = await client.SendAsync(
+                    "reset",
+                    new { seed = CurrentSeed, policy = selectedPolicy, nworld = 1, scenario = scenario.ScenarioId },
+                    lifetimeCancellation.Token);
                 currentState = reset.state;
                 visualizer.ApplyState(currentState);
                 RandomizeScene(CurrentSeed);
@@ -164,7 +179,7 @@ namespace MJWarpDemo
             var startInfo = new ProcessStartInfo
             {
                 FileName = python,
-                Arguments = $"-m mjwarp_demo.server --host {Host} --port {Port}",
+                Arguments = $"-m mjwarp_demo.server --host {Host} --port {Port} --scenario {scenario.ScenarioId}",
                 WorkingDirectory = backendRoot,
                 UseShellExecute = false,
                 CreateNoWindow = true,
@@ -219,7 +234,10 @@ namespace MJWarpDemo
             if (!client.IsConnected)
                 await ConnectBackendAsync();
             status = $"正在重置{PolicyDisplayName(policy)}回合（随机种子 {seed}）";
-            ResponseEnvelope reset = await client.SendAsync("reset", new { seed, policy, nworld = 1 }, lifetimeCancellation.Token);
+            ResponseEnvelope reset = await client.SendAsync(
+                "reset",
+                new { seed, policy, nworld = 1, scenario = scenario.ScenarioId },
+                lifetimeCancellation.Token);
             currentState = reset.state;
             visualizer.ApplyState(currentState);
             visualizer.RandomizeAppearance(seed);
@@ -230,7 +248,14 @@ namespace MJWarpDemo
             {
                 ResponseEnvelope started = await client.SendAsync(
                     "record_start",
-                    new { seed, policy, image_width = MultiModalCapture.Width, image_height = MultiModalCapture.Height },
+                    new
+                    {
+                        seed,
+                        policy,
+                        scenario = scenario.ScenarioId,
+                        image_width = MultiModalCapture.Width,
+                        image_height = MultiModalCapture.Height,
+                    },
                     lifetimeCancellation.Token);
                 recordingStarted = true;
                 status = $"正在录制：{started.episode_id}";
@@ -240,7 +265,10 @@ namespace MJWarpDemo
             {
                 while (!stopRequested && !currentState.terminated)
                 {
-                    ResponseEnvelope stepped = await client.SendAsync("step", new { nworld = 1 }, lifetimeCancellation.Token);
+                    ResponseEnvelope stepped = await client.SendAsync(
+                        "step",
+                        new { nworld = 1, scenario = scenario.ScenarioId },
+                        lifetimeCancellation.Token);
                     currentState = stepped.state;
                     visualizer.ApplyState(currentState);
                     await Task.Yield();
@@ -259,7 +287,7 @@ namespace MJWarpDemo
                             },
                             lifetimeCancellation.Token);
                     }
-                    status = $"{PolicyDisplayName(policy)}｜帧 {currentState.frame_id}/120｜奖励 {currentState.reward:F3}";
+                    status = $"{PolicyDisplayName(policy)}｜帧 {currentState.frame_id}/{modelSpec?.max_frames ?? 120}｜奖励 {currentState.reward:F3}";
                 }
             }
             finally
@@ -280,7 +308,13 @@ namespace MJWarpDemo
                 status = "正在测试 1/64/256/1024 个并行环境……";
                 ResponseEnvelope result = await client.SendAsync(
                     "benchmark",
-                    new { sizes = new[] { 1, 64, 256, 1024 }, steps = 300, warmup = 30 },
+                    new
+                    {
+                        scenario = scenario.ScenarioId,
+                        sizes = new[] { 1, 64, 256, 1024 },
+                        steps = 300,
+                        warmup = 30,
+                    },
                     lifetimeCancellation.Token);
                 benchmarkResults = result.results;
                 status = "GPU 性能测试完成";
@@ -319,10 +353,20 @@ namespace MJWarpDemo
                 40f + (float)random.NextDouble() * 18f,
                 -45f + (float)random.NextDouble() * 30f,
                 0f);
-            float cameraX = -0.02f + ((float)random.NextDouble() - 0.5f) * 0.05f;
-            float cameraZ = -0.88f + ((float)random.NextDouble() - 0.5f) * 0.05f;
-            mainCamera.transform.position = new Vector3(cameraX, 0.86f, cameraZ);
-            mainCamera.transform.LookAt(new Vector3(-0.04f, 0.035f, 0f));
+            float cameraX = baseCameraPosition.x + ((float)random.NextDouble() - 0.5f) * 0.05f;
+            float cameraZ = baseCameraPosition.z + ((float)random.NextDouble() - 0.5f) * 0.05f;
+            mainCamera.transform.position = new Vector3(cameraX, baseCameraPosition.y, cameraZ);
+            mainCamera.transform.LookAt(baseCameraLookAt);
+        }
+
+        private void ApplyModelPresentation(ModelSpec spec)
+        {
+            if (spec?.camera_position != null && spec.camera_position.Length >= 3)
+                baseCameraPosition = MjWarpCoordinates.Position(spec.camera_position);
+            if (spec?.camera_look_at != null && spec.camera_look_at.Length >= 3)
+                baseCameraLookAt = MjWarpCoordinates.Position(spec.camera_look_at);
+            mainCamera.transform.position = baseCameraPosition;
+            mainCamera.transform.LookAt(baseCameraLookAt);
         }
 
         private int CurrentSeed => int.TryParse(seedText, out int seed) ? seed : 0;
@@ -339,7 +383,12 @@ namespace MJWarpDemo
                 GUI.skin.font = chineseFont;
             const float panelWidth = 390f;
             GUILayout.BeginArea(new Rect(12f, 12f, panelWidth, Screen.height - 24f), GUI.skin.box);
-            GUILayout.Label("MJWarp × Unity 具身训练数据演示", HeaderStyle());
+            GUILayout.Label($"MJWarp × Unity｜{scenario?.DisplayName ?? "具身训练数据演示"}", HeaderStyle());
+            if (scenario != null)
+            {
+                GUILayout.Label($"业务类型：{scenario.BusinessType}");
+                GUILayout.Label(scenario.Description, GUI.skin.label);
+            }
             GUILayout.Label($"状态：{status}");
             GUILayout.Label(backendInfo == null
                 ? "后端：未连接"
@@ -356,6 +405,23 @@ namespace MJWarpDemo
             GUILayout.EndHorizontal();
             GUILayout.Label($"当前策略：{PolicyDisplayName(selectedPolicy)}");
             recordEpisode = GUILayout.Toggle(recordEpisode, "录制严格对齐的 HDF5 回合数据");
+
+            GUILayout.Space(4f);
+            GUILayout.Label("切换业务场景");
+            GUI.enabled = !busy;
+            for (int rowIndex = 0; rowIndex < MjWarpScenarioCatalog.All.Count; rowIndex += 2)
+            {
+                GUILayout.BeginHorizontal();
+                for (int column = 0; column < 2 && rowIndex + column < MjWarpScenarioCatalog.All.Count; column++)
+                {
+                    MjWarpScenarioInfo item = MjWarpScenarioCatalog.All[rowIndex + column];
+                    string label = item.ScenarioId == scenario?.ScenarioId ? $"● {item.DisplayName}" : item.DisplayName;
+                    if (GUILayout.Button(label))
+                        SceneManager.LoadScene(item.SceneName);
+                }
+                GUILayout.EndHorizontal();
+            }
+            GUI.enabled = true;
 
             GUILayout.BeginHorizontal();
             GUI.enabled = !busy && client != null && client.IsConnected;
@@ -379,6 +445,7 @@ namespace MJWarpDemo
                 GUILayout.Space(6f);
                 GUILayout.Label($"帧 {currentState.frame_id}｜仿真时间 {currentState.sim_time:F3} 秒");
                 GUILayout.Label($"奖励 {currentState.reward:F4}｜接触数 {currentState.contacts?.count ?? 0}");
+                GUILayout.Label($"任务阶段 {currentState.task_stage}｜距目标 {currentState.distance_to_goal:F3} 米");
                 GUILayout.Label($"成功 {YesNo(currentState.success)}｜已结束 {YesNo(currentState.terminated)}");
                 if (currentState.metrics != null)
                     GUILayout.Label($"交互物理吞吐：{currentState.metrics.physics_steps_per_second:F0} 步/秒");

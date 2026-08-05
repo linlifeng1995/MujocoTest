@@ -28,6 +28,8 @@ namespace MJWarpDemo.Tests
             yield return Await(helloTask);
             ResponseEnvelope hello = helloTask.Result;
             Assert.That(hello.backend.name, Is.EqualTo("MJWarp"));
+            Assert.That(hello.model_spec.scenario_id, Is.EqualTo("planar_push"));
+            Assert.That(hello.scenarios.Length, Is.EqualTo(4));
             Assert.That(hello.model_spec.geoms.Length, Is.GreaterThan(0));
 
             camera = new GameObject("Test Capture Camera").AddComponent<Camera>();

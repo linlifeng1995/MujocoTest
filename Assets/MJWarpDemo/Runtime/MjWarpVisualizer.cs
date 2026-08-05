@@ -63,7 +63,7 @@ namespace MJWarpDemo
                 });
             }
 
-            CreateGoalMarker();
+            CreateGoalMarker(spec.goal_radius > 0f ? spec.goal_radius : 0.06f);
         }
 
         private GameObject CreateGeom(GeomSpec geom)
@@ -139,12 +139,13 @@ namespace MJWarpDemo
             return material;
         }
 
-        private void CreateGoalMarker()
+        private void CreateGoalMarker(float radius)
         {
             GameObject goal = GameObject.CreatePrimitive(PrimitiveType.Cylinder);
             goal.name = "Goal Target";
             goal.transform.SetParent(root.transform, false);
-            goal.transform.localScale = new Vector3(0.12f, 0.003f, 0.12f);
+            float diameter = radius * 2f;
+            goal.transform.localScale = new Vector3(diameter, 0.003f, diameter);
             Collider collider = goal.GetComponent<Collider>();
             if (collider != null)
                 UnityEngine.Object.Destroy(collider);

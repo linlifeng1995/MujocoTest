@@ -29,18 +29,26 @@ REQUIRED = (
     "images/instance_id",
 )
 
+SCHEMA_1_1_REQUIRED = (
+    "observations/goal_position",
+    "observations/task_stage",
+    "observations/distance_to_goal",
+)
+
 
 def validate_file(path: Path) -> list[str]:
     errors: list[str] = []
     try:
         with h5py.File(path, "r") as dataset:
-            if dataset.attrs.get("schema_version") != "1.0":
-                errors.append("schema_version must be 1.0")
-            missing = [name for name in REQUIRED if name not in dataset]
+            schema_version = str(dataset.attrs.get("schema_version", ""))
+            if schema_version not in {"1.0", "1.1"}:
+                errors.append("schema_version must be 1.0 or 1.1")
+            required = REQUIRED + (SCHEMA_1_1_REQUIRED if schema_version == "1.1" else ())
+            missing = [name for name in required if name not in dataset]
             errors.extend(f"missing dataset: {name}" for name in missing)
             if missing:
                 return errors
-            lengths = {name: int(dataset[name].shape[0]) for name in REQUIRED}
+            lengths = {name: int(dataset[name].shape[0]) for name in required}
             expected = lengths["timestamps"]
             if expected <= 0:
                 errors.append("episode contains no frames")
@@ -62,6 +70,7 @@ def validate_file(path: Path) -> list[str]:
                 "observations/body_position",
                 "observations/body_quaternion",
                 "observations/body_external_wrench",
+                *(SCHEMA_1_1_REQUIRED if schema_version == "1.1" else ()),
                 "actions",
                 "rewards",
                 "contacts/position",

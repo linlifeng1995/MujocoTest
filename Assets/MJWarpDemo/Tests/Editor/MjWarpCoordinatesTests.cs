@@ -26,5 +26,15 @@ namespace MJWarpDemo.Tests
         {
             Assert.That(MjWarpCoordinates.Size(2f, 4f, 6f), Is.EqualTo(new Vector3(2f, 6f, 4f)));
         }
+
+        [Test]
+        public void ScenarioCatalogContainsOneScenePerBusinessTask()
+        {
+            Assert.That(MjWarpScenarioCatalog.All.Count, Is.EqualTo(4));
+            Assert.That(MjWarpScenarioCatalog.FindById("precision_insert").SceneName,
+                Is.EqualTo("PrecisionAssemblyScene"));
+            Assert.That(MjWarpScenarioCatalog.FindById("warehouse_navigation").DisplayName,
+                Is.EqualTo("仓储移动机器人"));
+        }
     }
 }

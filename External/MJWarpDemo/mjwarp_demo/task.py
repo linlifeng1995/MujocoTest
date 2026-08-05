@@ -12,14 +12,14 @@ import numpy as np
 import warp as wp
 
 from .recorder import MAX_CONTACTS
+from .scenarios import DEFAULT_SCENARIO_ID, ScenarioDefinition, get_scenario
 
 PHYSICS_DT = 0.005
 ACTION_REPEAT = 10
 CONTROL_DT = PHYSICS_DT * ACTION_REPEAT
 MAX_FRAMES = 120
-MAX_JOINT_SPEED = 2.5
-BASE_XY = np.array([-0.35, 0.0], dtype=np.float32)
-LINK_LENGTHS = (0.32, 0.28)
+ARM_BASE_XY = np.array([-0.35, 0.0], dtype=np.float32)
+ARM_LINK_LENGTHS = (0.32, 0.28)
 
 
 def _name(model: mujoco.MjModel, object_type: mujoco.mjtObj, object_id: int, fallback: str) -> str:
@@ -30,29 +30,57 @@ def _wrap_angle(value: np.ndarray) -> np.ndarray:
     return (value + np.pi) % (2.0 * np.pi) - np.pi
 
 
-class PlanarPushTask:
-    """Batched MJWarp task. Physics is authoritative; Unity is a visual client."""
+class EmbodiedTask:
+    """Scenario-aware batched MJWarp task; Unity remains a visual/data client."""
 
-    def __init__(self, model_path: Path, nworld: int = 1, device: str = "cuda:0") -> None:
+    def __init__(
+        self,
+        definition: ScenarioDefinition,
+        model_path: Path,
+        nworld: int = 1,
+        device: str = "cuda:0",
+    ) -> None:
         wp.init()
         if device.startswith("cuda") and not wp.is_cuda_available():
             raise RuntimeError("MJWarp demo requires a CUDA-capable GPU; no CUDA device was found")
+        self.definition = definition
+        self.task_name = definition.scenario_id
         self.device = wp.get_device(device)
-        self.model_path = model_path
+        self.model_path = Path(model_path)
         self.nworld = int(nworld)
-        self.mj_model = mujoco.MjModel.from_xml_path(str(model_path))
+        self.mj_model = mujoco.MjModel.from_xml_path(str(self.model_path))
         if not math.isclose(float(self.mj_model.opt.timestep), PHYSICS_DT, abs_tol=1e-9):
             raise ValueError(f"MJCF timestep must be {PHYSICS_DT}")
+        if self.mj_model.nu != 2:
+            raise ValueError(f"scenario {self.task_name} must expose exactly two actuators")
 
         with wp.ScopedDevice(self.device):
             self.model = mjw.put_model(self.mj_model)
             self.data = mjw.make_data(self.mj_model, nworld=self.nworld)
 
-        self.shoulder_qpos_adr = int(self.mj_model.jnt_qposadr[mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_JOINT, "shoulder")])
-        self.elbow_qpos_adr = int(self.mj_model.jnt_qposadr[mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_JOINT, "elbow")])
-        self.cube_qpos_adr = int(self.mj_model.jnt_qposadr[mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_JOINT, "cube_free")])
-        self.cube_body_id = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, "cube")
-        self.pusher_body_id = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, "pusher")
+        joint_ids = [
+            mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_JOINT, name)
+            for name in definition.controlled_joints
+        ]
+        if any(joint_id < 0 for joint_id in joint_ids):
+            raise ValueError(f"scenario {self.task_name} is missing controlled joints {definition.controlled_joints}")
+        self.controlled_qpos_adr = np.asarray([self.mj_model.jnt_qposadr[joint_id] for joint_id in joint_ids], dtype=np.int32)
+        self.controlled_dof_adr = np.asarray([self.mj_model.jnt_dofadr[joint_id] for joint_id in joint_ids], dtype=np.int32)
+        self.agent_body_id = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, definition.agent_body)
+        if self.agent_body_id < 0:
+            raise ValueError(f"scenario {self.task_name} is missing agent body {definition.agent_body}")
+
+        self.object_qpos_adr: int | None = None
+        self.object_body_id: int | None = None
+        if definition.object_joint is not None:
+            object_joint_id = mujoco.mj_name2id(
+                self.mj_model, mujoco.mjtObj.mjOBJ_JOINT, definition.object_joint
+            )
+            self.object_qpos_adr = int(self.mj_model.jnt_qposadr[object_joint_id])
+        if definition.object_body is not None:
+            self.object_body_id = mujoco.mj_name2id(
+                self.mj_model, mujoco.mjtObj.mjOBJ_BODY, definition.object_body
+            )
 
         self.rng = np.random.default_rng(0)
         self.policy = "expert"
@@ -82,34 +110,16 @@ class PlanarPushTask:
 
         qpos = np.tile(np.asarray(self.mj_model.qpos0, dtype=np.float32), (self.nworld, 1))
         qvel = np.zeros((self.nworld, self.mj_model.nv), dtype=np.float32)
-
-        cube_xy = np.column_stack(
-            (
-                self.rng.uniform(0.00, 0.07, self.nworld),
-                self.rng.uniform(-0.11, 0.11, self.nworld),
-            )
-        ).astype(np.float32)
-        target_xy = np.column_stack(
-            (
-                self.rng.uniform(0.16, 0.22, self.nworld),
-                np.clip(cube_xy[:, 1] + self.rng.uniform(-0.07, 0.07, self.nworld), -0.16, 0.16),
-            )
-        ).astype(np.float32)
-        self.goal[:, :2] = target_xy
-        self.goal[:, 2] = 0.002
-
-        qpos[:, self.cube_qpos_adr : self.cube_qpos_adr + 3] = np.column_stack(
-            (cube_xy, np.full(self.nworld, 0.041, dtype=np.float32))
-        )
-        qpos[:, self.cube_qpos_adr + 3 : self.cube_qpos_adr + 7] = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
-
-        push_dir = target_xy - cube_xy
-        push_dir /= np.maximum(np.linalg.norm(push_dir, axis=1, keepdims=True), 1e-6)
-        behind = cube_xy - push_dir * 0.105
-        initial_joint = self._ik(behind)
-        initial_joint += self.rng.normal(0.0, 0.015, initial_joint.shape).astype(np.float32)
-        qpos[:, self.shoulder_qpos_adr] = initial_joint[:, 0]
-        qpos[:, self.elbow_qpos_adr] = initial_joint[:, 1]
+        if self.definition.mode == "push":
+            self._reset_push(qpos)
+        elif self.definition.mode == "insert":
+            self._reset_insert(qpos)
+        elif self.definition.mode == "reach":
+            self._reset_reach(qpos)
+        elif self.definition.mode == "navigate":
+            self._reset_navigation(qpos)
+        else:
+            raise ValueError(f"unsupported scenario mode: {self.definition.mode}")
 
         with wp.ScopedDevice(self.device):
             self.data.qpos.assign(qpos)
@@ -127,13 +137,98 @@ class PlanarPushTask:
         self.last_action.fill(0.0)
         self.last_reward.fill(0.0)
         self.frame_id = 0
-        cube_after_reset = self._cube_positions()
-        self.previous_distance = np.linalg.norm(cube_after_reset[:, :2] - self.goal[:, :2], axis=1).astype(np.float32)
+        position = self._evaluation_positions()
+        self.previous_distance = np.linalg.norm(position[:, :2] - self.goal[:, :2], axis=1).astype(np.float32)
         return self.state_dict()
 
+    def _reset_push(self, qpos: np.ndarray) -> None:
+        object_xy = np.column_stack(
+            (
+                self.rng.uniform(0.00, 0.07, self.nworld),
+                self.rng.uniform(-0.11, 0.11, self.nworld),
+            )
+        ).astype(np.float32)
+        goal_xy = np.column_stack(
+            (
+                self.rng.uniform(0.16, 0.22, self.nworld),
+                np.clip(object_xy[:, 1] + self.rng.uniform(-0.07, 0.07, self.nworld), -0.16, 0.16),
+            )
+        ).astype(np.float32)
+        self._place_object_and_arm(qpos, object_xy, goal_xy, height=0.041, behind_distance=0.105)
+
+    def _reset_insert(self, qpos: np.ndarray) -> None:
+        goal_xy = np.column_stack(
+            (
+                self.rng.uniform(0.115, 0.13, self.nworld),
+                self.rng.uniform(-0.012, 0.012, self.nworld),
+            )
+        ).astype(np.float32)
+        object_xy = np.column_stack(
+            (
+                self.rng.uniform(-0.01, 0.025, self.nworld),
+                np.clip(goal_xy[:, 1] + self.rng.uniform(-0.012, 0.012, self.nworld), -0.020, 0.020),
+            )
+        ).astype(np.float32)
+        self._place_object_and_arm(qpos, object_xy, goal_xy, height=0.031, behind_distance=0.095)
+
+    def _place_object_and_arm(
+        self,
+        qpos: np.ndarray,
+        object_xy: np.ndarray,
+        goal_xy: np.ndarray,
+        *,
+        height: float,
+        behind_distance: float,
+    ) -> None:
+        if self.object_qpos_adr is None:
+            raise ValueError(f"scenario {self.task_name} requires a free object joint")
+        self.goal[:, :2] = goal_xy
+        self.goal[:, 2] = 0.002
+        qpos[:, self.object_qpos_adr : self.object_qpos_adr + 3] = np.column_stack(
+            (object_xy, np.full(self.nworld, height, dtype=np.float32))
+        )
+        qpos[:, self.object_qpos_adr + 3 : self.object_qpos_adr + 7] = np.array(
+            [1.0, 0.0, 0.0, 0.0], dtype=np.float32
+        )
+        push_dir = goal_xy - object_xy
+        push_dir /= np.maximum(np.linalg.norm(push_dir, axis=1, keepdims=True), 1e-6)
+        behind = object_xy - push_dir * behind_distance
+        initial_joint = self._ik(behind)
+        initial_joint += self.rng.normal(0.0, 0.015, initial_joint.shape).astype(np.float32)
+        qpos[:, self.controlled_qpos_adr] = initial_joint
+
+    def _reset_reach(self, qpos: np.ndarray) -> None:
+        stations = np.asarray(
+            [[0.02, -0.15], [0.15, 0.0], [0.02, 0.15]], dtype=np.float32
+        )
+        selected = self.rng.integers(0, len(stations), size=self.nworld)
+        self.goal[:, :2] = stations[selected]
+        self.goal[:, 2] = 0.06
+        home = np.tile(np.asarray([0.02, 0.0], dtype=np.float32), (self.nworld, 1))
+        initial_joint = self._ik(home)
+        initial_joint += self.rng.normal(0.0, 0.04, initial_joint.shape).astype(np.float32)
+        qpos[:, self.controlled_qpos_adr] = initial_joint
+
+    def _reset_navigation(self, qpos: np.ndarray) -> None:
+        start_xy = np.column_stack(
+            (
+                self.rng.uniform(-0.53, -0.46, self.nworld),
+                self.rng.uniform(-0.34, 0.34, self.nworld),
+            )
+        ).astype(np.float32)
+        goal_xy = np.column_stack(
+            (
+                self.rng.uniform(0.46, 0.53, self.nworld),
+                self.rng.uniform(-0.34, 0.34, self.nworld),
+            )
+        ).astype(np.float32)
+        qpos[:, self.controlled_qpos_adr] = start_xy
+        self.goal[:, :2] = goal_xy
+        self.goal[:, 2] = 0.005
+
     def _ik(self, target_xy: np.ndarray) -> np.ndarray:
-        l1, l2 = LINK_LENGTHS
-        rel = np.asarray(target_xy, dtype=np.float32) - BASE_XY
+        l1, l2 = ARM_LINK_LENGTHS
+        rel = np.asarray(target_xy, dtype=np.float32) - ARM_BASE_XY
         radius = np.linalg.norm(rel, axis=1)
         safe_radius = np.clip(radius, abs(l1 - l2) + 1e-3, l1 + l2 - 1e-3)
         rel = rel * (safe_radius / np.maximum(radius, 1e-6))[:, None]
@@ -147,22 +242,56 @@ class PlanarPushTask:
             noise = self.rng.uniform(-1.0, 1.0, (self.nworld, 2)).astype(np.float32)
             self.random_action = np.clip(0.86 * self.random_action + 0.24 * noise, -1.0, 1.0)
             return self.random_action.copy()
+        if self.definition.mode in {"push", "insert"}:
+            return self._push_policy_action()
+        if self.definition.mode == "reach":
+            desired_joint = self._ik(self.goal[:, :2])
+            return self._joint_velocity_action(desired_joint)
+        if self.definition.mode == "navigate":
+            return self._navigation_policy_action()
+        raise ValueError(f"unsupported scenario mode: {self.definition.mode}")
 
-        cube = self._cube_positions()[:, :2]
-        pusher = self._body_positions()[:, self.pusher_body_id, :2]
-        push_dir = self.goal[:, :2] - cube
+    def _push_policy_action(self) -> np.ndarray:
+        object_position = self._object_positions()[:, :2]
+        pusher = self._body_positions()[:, self.agent_body_id, :2]
+        push_dir = self.goal[:, :2] - object_position
         push_dir /= np.maximum(np.linalg.norm(push_dir, axis=1, keepdims=True), 1e-6)
-        behind = cube - push_dir * 0.095
-        self.stage[np.linalg.norm(pusher - behind, axis=1) < 0.055] = 1
-        push_target = self.goal[:, :2] + push_dir * 0.035
+        behind_offset = 0.095 if self.definition.mode == "push" else 0.082
+        behind = object_position - push_dir * behind_offset
+        distance_to_object = np.linalg.norm(pusher - object_position, axis=1)
+        self.stage[(self.stage == 1) & (distance_to_object > 0.12)] = 0
+        self.stage[np.linalg.norm(pusher - behind, axis=1) < 0.050] = 1
+        contact_depth = 0.055 if self.definition.mode == "push" else 0.042
+        push_target = object_position + push_dir * contact_depth
         target = np.where((self.stage == 0)[:, None], behind, push_target)
+        return self._joint_velocity_action(self._ik(target))
 
-        desired_joint = self._ik(target)
+    def _joint_velocity_action(self, desired_joint: np.ndarray) -> np.ndarray:
         qpos = self.data.qpos.numpy()
-        current_joint = qpos[:, [self.shoulder_qpos_adr, self.elbow_qpos_adr]]
+        current_joint = qpos[:, self.controlled_qpos_adr]
         error = _wrap_angle(desired_joint - current_joint)
-        desired_velocity = np.clip(error * 5.0, -MAX_JOINT_SPEED, MAX_JOINT_SPEED)
-        return (desired_velocity / MAX_JOINT_SPEED).astype(np.float32)
+        desired_velocity = np.clip(
+            error * 5.0, -self.definition.max_speed, self.definition.max_speed
+        )
+        return (desired_velocity / self.definition.max_speed).astype(np.float32)
+
+    def _navigation_policy_action(self) -> np.ndarray:
+        position = self._body_positions()[:, self.agent_body_id, :2]
+        waypoint_left = np.tile(np.asarray([-0.14, 0.0], dtype=np.float32), (self.nworld, 1))
+        waypoint_right = np.tile(np.asarray([0.14, 0.0], dtype=np.float32), (self.nworld, 1))
+        distance_left = np.linalg.norm(position - waypoint_left, axis=1)
+        self.stage[(self.stage == 0) & (distance_left < 0.07)] = 1
+        distance_right = np.linalg.norm(position - waypoint_right, axis=1)
+        self.stage[(self.stage == 1) & (distance_right < 0.07)] = 2
+        target = np.where(
+            (self.stage == 0)[:, None],
+            waypoint_left,
+            np.where((self.stage == 1)[:, None], waypoint_right, self.goal[:, :2]),
+        )
+        desired_velocity = np.clip(
+            (target - position) * 3.0, -self.definition.max_speed, self.definition.max_speed
+        )
+        return (desired_velocity / self.definition.max_speed).astype(np.float32)
 
     def step(self, action: np.ndarray | list[float] | None = None) -> dict[str, Any]:
         if bool(np.all(self.terminated)):
@@ -177,10 +306,15 @@ class PlanarPushTask:
             if action_array.shape != (self.nworld, 2):
                 raise ValueError(f"action must have shape (2,) or ({self.nworld}, 2), got {action_array.shape}")
             action_array = np.clip(action_array, -1.0, 1.0)
+        action_array[self.terminated] = 0.0
 
-        qvel = self.data.qvel.numpy()[:, :2]
-        desired_velocity = action_array * MAX_JOINT_SPEED
-        torque = np.clip(4.0 * (desired_velocity - qvel), -8.0, 8.0).astype(np.float32)
+        qvel = self.data.qvel.numpy()[:, self.controlled_dof_adr]
+        desired_velocity = action_array * self.definition.max_speed
+        torque = np.clip(
+            4.0 * (desired_velocity - qvel),
+            -self.definition.torque_limit,
+            self.definition.torque_limit,
+        ).astype(np.float32)
         controls = np.zeros((self.nworld, self.mj_model.nu), dtype=np.float32)
         controls[:, :2] = torque
 
@@ -192,25 +326,40 @@ class PlanarPushTask:
 
         self.frame_id += 1
         self.last_action = action_array
-        cube = self._cube_positions()
-        distance = np.linalg.norm(cube[:, :2] - self.goal[:, :2], axis=1).astype(np.float32)
+        position = self._evaluation_positions()
+        distance = np.linalg.norm(position[:, :2] - self.goal[:, :2], axis=1).astype(np.float32)
         progress = self.previous_distance - distance
-        reached = distance < 0.06
+        reached = distance < self.definition.goal_radius
         self.success_streak = np.where(reached, self.success_streak + 1, 0)
-        self.success |= self.success_streak >= 3
-        out_of_bounds = (np.abs(cube[:, 0]) > 0.8) | (np.abs(cube[:, 1]) > 0.6) | (cube[:, 2] < -0.02)
+        self.success |= self.success_streak >= self.definition.success_frames
+        out_of_bounds = (
+            (np.abs(position[:, 0]) > 0.80)
+            | (np.abs(position[:, 1]) > 0.62)
+            | (position[:, 2] < -0.02)
+        )
         timed_out = self.frame_id >= MAX_FRAMES
         self.terminated |= self.success | out_of_bounds | timed_out
-        self.last_reward = (5.0 * progress - 0.01 * np.sum(action_array**2, axis=1) + self.success.astype(np.float32)).astype(np.float32)
+        self.last_reward = (
+            self.definition.progress_scale * progress
+            - 0.01 * np.sum(action_array**2, axis=1)
+            + self.success.astype(np.float32)
+        ).astype(np.float32)
         self.previous_distance = distance
         elapsed = max(time.perf_counter() - start, 1e-9)
         return self.state_dict(control_steps_per_second=self.nworld / elapsed)
 
-    def _cube_positions(self) -> np.ndarray:
-        return self.data.qpos.numpy()[:, self.cube_qpos_adr : self.cube_qpos_adr + 3]
+    def _object_positions(self) -> np.ndarray:
+        if self.object_qpos_adr is None:
+            raise ValueError(f"scenario {self.task_name} does not have a free object")
+        return self.data.qpos.numpy()[:, self.object_qpos_adr : self.object_qpos_adr + 3]
 
     def _body_positions(self) -> np.ndarray:
         return self.data.xpos.numpy()
+
+    def _evaluation_positions(self) -> np.ndarray:
+        if self.object_qpos_adr is not None:
+            return self._object_positions()
+        return self._body_positions()[:, self.agent_body_id, :]
 
     def _contacts_for_world(self, world_id: int) -> dict[str, Any]:
         count_total = int(self.data.nacon.numpy()[0])
@@ -250,6 +399,7 @@ class PlanarPushTask:
         return {
             "frame_id": self.frame_id,
             "sim_time": sim_time,
+            "scenario_id": self.task_name,
             "qpos": qpos.tolist(),
             "qvel": qvel.tolist(),
             "body_position": body_position.tolist(),
@@ -260,6 +410,8 @@ class PlanarPushTask:
             "terminated": bool(self.terminated[0]),
             "success": bool(self.success[0]),
             "goal_position": self.goal[0].tolist(),
+            "task_stage": int(self.stage[0]),
+            "distance_to_goal": float(self.previous_distance[0]),
             "contacts": self._contacts_for_world(0),
             "metrics": {
                 "nworld": self.nworld,
@@ -304,16 +456,50 @@ class PlanarPushTask:
                 }
             )
         return {
-            "name": "planar_push",
+            "name": self.task_name,
+            "scenario_id": self.task_name,
+            "display_name": self.definition.display_name,
+            "business_type": self.definition.business_type,
+            "description": self.definition.description,
+            "official_reference": self.definition.official_reference,
             "physics_dt": PHYSICS_DT,
             "control_dt": CONTROL_DT,
             "max_frames": MAX_FRAMES,
+            "goal_radius": self.definition.goal_radius,
+            "camera_position": list(self.definition.camera_position),
+            "camera_look_at": list(self.definition.camera_look_at),
             "bodies": bodies,
             "geoms": geoms,
         }
 
 
-def benchmark_sizes(model_path: Path, sizes: Iterable[int], steps: int = 300, warmup: int = 30, device: str = "cuda:0") -> list[dict[str, Any]]:
+class PlanarPushTask(EmbodiedTask):
+    """Backward-compatible entry point retained for existing scripts and tests."""
+
+    def __init__(self, model_path: Path, nworld: int = 1, device: str = "cuda:0") -> None:
+        super().__init__(get_scenario(DEFAULT_SCENARIO_ID), model_path, nworld=nworld, device=device)
+
+
+def create_task(
+    scenario_id: str,
+    package_root: Path,
+    *,
+    nworld: int = 1,
+    device: str = "cuda:0",
+    model_override: Path | None = None,
+) -> EmbodiedTask:
+    definition = get_scenario(scenario_id)
+    model_path = model_override or definition.model_path(package_root)
+    return EmbodiedTask(definition, model_path, nworld=nworld, device=device)
+
+
+def benchmark_sizes(
+    model_path: Path,
+    sizes: Iterable[int],
+    steps: int = 300,
+    warmup: int = 30,
+    device: str = "cuda:0",
+) -> list[dict[str, Any]]:
     wp.init()
     cuda_device = wp.get_device(device)
     mj_model = mujoco.MjModel.from_xml_path(str(model_path))
