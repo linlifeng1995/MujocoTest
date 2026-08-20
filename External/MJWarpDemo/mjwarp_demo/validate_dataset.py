@@ -95,6 +95,24 @@ SCHEMA_2_0_REQUIRED_ATTRS = (
     "license_manifest",
 )
 
+MINI_PILOT_V0_2_OBSERVATIONS = (
+    "contacts/body_pair",
+    "contacts/category_pair",
+    "contacts/type_id",
+    "contacts/is_target",
+    "task_metrics/insertion_depth_m",
+    "task_metrics/axial_error_m",
+    "task_metrics/object_contact_load_n",
+    "task_metrics/maximum_target_penetration_m",
+    "images/front_depth_valid",
+    "images/wrist_instance_id",
+)
+
+MINI_PILOT_V0_2_REQUIRED_ATTRS = (
+    "contact_semantics",
+    "depth_spec",
+)
+
 
 def validate_file(path: Path) -> list[str]:
     errors: list[str] = []
@@ -111,6 +129,17 @@ def validate_file(path: Path) -> list[str]:
                     if name not in dataset
                 ]
                 errors.extend(f"missing dataset: {name}" for name in missing)
+                schema_profile = str(dataset.attrs.get("schema_profile", ""))
+                if schema_profile == "panda-mini-pilot-v0.2":
+                    missing_profile_attrs = [
+                        name for name in MINI_PILOT_V0_2_REQUIRED_ATTRS if name not in dataset.attrs
+                    ]
+                    errors.extend(f"missing attribute: {name}" for name in missing_profile_attrs)
+                    missing_profile = [
+                        name for name in MINI_PILOT_V0_2_OBSERVATIONS if name not in dataset
+                    ]
+                    errors.extend(f"missing dataset: {name}" for name in missing_profile)
+                    missing.extend(missing_profile)
                 if missing:
                     return errors
                 observation_count = int(dataset["timestamps"].shape[0])
@@ -124,6 +153,12 @@ def validate_file(path: Path) -> list[str]:
                 for name in SCHEMA_2_0_OBSERVATIONS:
                     if dataset[name].shape[0] != observation_count:
                         errors.append(f"observation length mismatch: {name}={dataset[name].shape[0]}")
+                if schema_profile == "panda-mini-pilot-v0.2":
+                    for name in MINI_PILOT_V0_2_OBSERVATIONS:
+                        if dataset[name].shape[0] != observation_count:
+                            errors.append(
+                                f"observation length mismatch: {name}={dataset[name].shape[0]}"
+                            )
                 for name in SCHEMA_2_0_TRANSITIONS:
                     if dataset[name].shape[0] != transition_count:
                         errors.append(f"transition length mismatch: {name}={dataset[name].shape[0]}")
@@ -142,10 +177,29 @@ def validate_file(path: Path) -> list[str]:
                     errors.append(f"unexpected depth shape: {dataset['images/front_depth_m'].shape}")
                 if dataset["images/front_instance_id"].shape[1:] != (height, width):
                     errors.append(f"unexpected instance shape: {dataset['images/front_instance_id'].shape}")
+                if schema_profile == "panda-mini-pilot-v0.2":
+                    if dataset["images/front_depth_valid"].shape[1:] != (height, width):
+                        errors.append(
+                            f"unexpected depth-valid shape: {dataset['images/front_depth_valid'].shape}"
+                        )
+                    if dataset["images/wrist_instance_id"].shape[1:] != (height, width):
+                        errors.append(
+                            f"unexpected wrist-instance shape: {dataset['images/wrist_instance_id'].shape}"
+                        )
+                    depth = np.asarray(dataset["images/front_depth_m"], dtype=np.float32)
+                    valid_depth = np.asarray(dataset["images/front_depth_valid"], dtype=np.bool_)
+                    if not np.array_equal(valid_depth, np.isfinite(depth) & (depth > 0.0)):
+                        errors.append("front_depth_valid does not match finite depth > 0")
                 finite_names = [
                     name for name in (*SCHEMA_2_0_OBSERVATIONS, *SCHEMA_2_0_TRANSITIONS)
                     if dataset[name].dtype.kind in "fiu"
                 ]
+                if schema_profile == "panda-mini-pilot-v0.2":
+                    finite_names.extend(
+                        name
+                        for name in MINI_PILOT_V0_2_OBSERVATIONS
+                        if dataset[name].dtype.kind in "fiu"
+                    )
                 for name in finite_names:
                     if not np.isfinite(dataset[name][...]).all():
                         errors.append(f"non-finite values in {name}")

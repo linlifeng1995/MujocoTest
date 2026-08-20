@@ -171,6 +171,7 @@ class DemoServer:
                 )
             )
             camera_metadata = message.get("camera_metadata", {})
+            default_profile = "panda-mini-pilot-v0.2" if bool(getattr(task, "is_panda", False)) else ""
             self.recorder = EpisodeRecorder(
                 self.dataset_dir,
                 episode_id,
@@ -190,7 +191,15 @@ class DemoServer:
                     "protocol_version": PROTOCOL_VERSION,
                     "unity_version": str(message.get("unity_version", "unknown")),
                     "application_version": str(message.get("application_version", "unknown")),
-                    "code_version": str(message.get("code_version", "pilot-v0.1")),
+                    "code_version": str(
+                        message.get(
+                            "code_version",
+                            "mini-pilot-v0.2" if default_profile else "pilot-v0.1",
+                        )
+                    ),
+                    "schema_profile": str(
+                        message.get("schema_profile", default_profile)
+                    ),
                     "data_source": str(message.get("data_source", "synthetic_simulation")),
                     "generation_strategy": str(message.get("generation_strategy", policy)),
                     "license_manifest": str(

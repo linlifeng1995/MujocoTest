@@ -52,6 +52,8 @@ namespace MJWarpDemo
         public float goal_radius;
         public float[] camera_position;
         public float[] camera_look_at;
+        public float camera_fov_degrees;
+        public float camera_near_clip_m;
         public RobotSpec robot;
         public BodySpec[] bodies;
         public GeomSpec[] geoms;
@@ -97,6 +99,8 @@ namespace MJWarpDemo
         public float[] position;
         public float[] quaternion;
         public float[] rgba;
+        public int group;
+        public string visual_role;
         public float[][] vertices;
         public int[] triangles;
     }
@@ -129,6 +133,7 @@ namespace MJWarpDemo
         public int task_stage;
         public float distance_to_goal;
         public ContactData contacts;
+        public TaskMetricsData task_metrics;
         public MetricsData metrics;
     }
 
@@ -138,10 +143,23 @@ namespace MJWarpDemo
         public int count;
         public bool[] valid;
         public int[][] geom_pair;
+        public int[][] body_pair;
+        public int[][] category_pair;
+        public int[] type_id;
+        public bool[] is_target;
         public float[][] position;
         public float[][] normal;
         public float[] distance;
         public bool overflow;
+    }
+
+    [Serializable]
+    public sealed class TaskMetricsData
+    {
+        public float insertion_depth_m;
+        public float axial_error_m;
+        public float object_contact_load_n;
+        public float maximum_target_penetration_m;
     }
 
     [Serializable]
@@ -205,5 +223,6 @@ namespace MJWarpDemo
         public byte[] Depth;
         public byte[] Instance;
         public byte[] WristRgb;
+        public byte[] WristInstance;
     }
 }

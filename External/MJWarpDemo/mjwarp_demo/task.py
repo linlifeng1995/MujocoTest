@@ -21,6 +21,22 @@ ARM_BASE_XY = np.array([-0.35, 0.0], dtype=np.float32)
 ARM_LINK_LENGTHS = (0.32, 0.28)
 PANDA_STAGE_DURATIONS = (50, 70, 35, 60, 90, 65, 35, 45)
 
+CONTACT_CATEGORY_NAMES = {
+    0: "unknown",
+    1: "robot",
+    2: "manipulated_object",
+    3: "target_fixture",
+    4: "environment",
+}
+CONTACT_TYPE_NAMES = {
+    0: "unknown",
+    1: "target_grasp",
+    2: "target_goal_contact",
+    3: "object_environment",
+    4: "non_target_collision",
+    5: "robot_self_contact",
+}
+
 
 def _name(model: mujoco.MjModel, object_type: mujoco.mjtObj, object_id: int, fallback: str) -> str:
     return mujoco.mj_id2name(model, object_type, object_id) or fallback
@@ -108,6 +124,21 @@ class EmbodiedTask:
             if self.object_body_id is not None
             else np.asarray([], dtype=np.int32)
         )
+        self.body_names = [
+            _name(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, body_id, f"body_{body_id}")
+            for body_id in range(self.mj_model.nbody)
+        ]
+        self.geom_names = [
+            _name(self.mj_model, mujoco.mjtObj.mjOBJ_GEOM, geom_id, f"geom_{geom_id}")
+            for geom_id in range(self.mj_model.ngeom)
+        ]
+        self.geom_body_ids = np.asarray(self.mj_model.geom_bodyid, dtype=np.int32)
+        self.geom_category_ids = np.asarray(
+            [self._classify_geom(geom_id) for geom_id in range(self.mj_model.ngeom)],
+            dtype=np.int8,
+        )
+        self.object_bottom_offset = self._object_bottom_offset()
+        self.insertion_entry_height = self._insertion_entry_height()
         self.grasp_weld_id = mujoco.mj_name2id(
             self.mj_model, mujoco.mjtObj.mjOBJ_EQUALITY, "expert_grasp_weld"
         )
@@ -151,6 +182,48 @@ class EmbodiedTask:
         self._grasp_weld_active = False
         self.reset(seed=0, policy="expert")
 
+    def _classify_geom(self, geom_id: int) -> int:
+        body_id = int(self.mj_model.geom_bodyid[geom_id])
+        if self.object_body_id is not None and body_id == self.object_body_id:
+            return 2
+        body_name = self.body_names[body_id]
+        if body_name in {"bin", "socket"}:
+            return 3
+        if body_name.startswith("link") or body_name in {"hand", "left_finger", "right_finger"}:
+            return 1
+        return 4
+
+    def _object_bottom_offset(self) -> float:
+        offsets: list[float] = []
+        for geom_id in self.object_geom_ids.tolist():
+            geom_type = int(self.mj_model.geom_type[geom_id])
+            size = np.asarray(self.mj_model.geom_size[geom_id], dtype=np.float64)
+            if geom_type == int(mujoco.mjtGeom.mjGEOM_CYLINDER):
+                half_height = float(size[1])
+            elif geom_type == int(mujoco.mjtGeom.mjGEOM_BOX):
+                half_height = float(size[2])
+            else:
+                continue
+            offsets.append(half_height - float(self.mj_model.geom_pos[geom_id, 2]))
+        return max(offsets, default=0.0)
+
+    def _insertion_entry_height(self) -> float:
+        socket_body_id = mujoco.mj_name2id(
+            self.mj_model, mujoco.mjtObj.mjOBJ_BODY, "socket"
+        )
+        if socket_body_id < 0:
+            return 0.0
+        wall_tops: list[float] = []
+        for geom_id in np.flatnonzero(self.geom_body_ids == socket_body_id).tolist():
+            if self.geom_names[geom_id] == "socket_base":
+                continue
+            wall_tops.append(
+                float(self.mj_model.body_pos[socket_body_id, 2])
+                + float(self.mj_model.geom_pos[geom_id, 2])
+                + float(self.mj_model.geom_size[geom_id, 2])
+            )
+        return max(wall_tops, default=0.0)
+
     @property
     def gpu_name(self) -> str:
         return self.device.name
@@ -160,7 +233,7 @@ class EmbodiedTask:
         return self.robot.robot_id == "franka_panda"
 
     def reset(self, seed: int, policy: str = "expert") -> dict[str, Any]:
-        if policy not in {"expert", "perturbed", "random", "learned"}:
+        if policy not in {"expert", "recovery", "perturbed", "random", "learned"}:
             raise ValueError(f"unsupported policy: {policy}")
         self.seed = int(seed)
         self.rng = np.random.default_rng(self.seed)
@@ -223,20 +296,24 @@ class EmbodiedTask:
             object_xy = np.column_stack(
                 (self.rng.uniform(0.42, 0.49, self.nworld), self.rng.uniform(-0.18, -0.07, self.nworld))
             ).astype(np.float32)
-            goal_xy = np.column_stack(
-                (self.rng.uniform(0.58, 0.66, self.nworld), self.rng.uniform(0.11, 0.20, self.nworld))
-            ).astype(np.float32)
+            fixture_name = "bin"
             object_z = 0.075
             goal_z = 0.082
         else:
             object_xy = np.column_stack(
                 (self.rng.uniform(0.40, 0.46, self.nworld), self.rng.uniform(-0.18, -0.10, self.nworld))
             ).astype(np.float32)
-            goal_xy = np.column_stack(
-                (self.rng.uniform(0.57, 0.63, self.nworld), self.rng.uniform(0.10, 0.17, self.nworld))
-            ).astype(np.float32)
+            fixture_name = "socket"
             object_z = 0.105
             goal_z = 0.105
+
+        fixture_body_id = mujoco.mj_name2id(
+            self.mj_model, mujoco.mjtObj.mjOBJ_BODY, fixture_name
+        )
+        if fixture_body_id < 0:
+            raise ValueError(f"scenario {self.task_name} is missing target fixture {fixture_name}")
+        fixture_xy = np.asarray(self.mj_model.body_pos[fixture_body_id, :2], dtype=np.float32)
+        goal_xy = np.tile(fixture_xy, (self.nworld, 1))
 
         qpos[:, self.object_qpos_adr : self.object_qpos_adr + 3] = np.column_stack(
             (object_xy, np.full(self.nworld, object_z, dtype=np.float32))
@@ -250,9 +327,31 @@ class EmbodiedTask:
             "randomization_group": f"panda-{self.seed % 20:02d}",
             "object_position": [float(object_xy[0, 0]), float(object_xy[0, 1]), object_z],
             "goal_position": self.goal[0].astype(float).tolist(),
+            "target_fixture": fixture_name,
+            "target_fixture_body_id": int(fixture_body_id),
+            "target_fixture_randomized": False,
+            "object_config_id": f"{self.task_name}-object-config-{self.seed % 20:02d}",
+            "scene_config_id": f"{self.task_name}-scene-config-{self.seed % 20:02d}",
             "object_mass_scale": float(self.rng.uniform(0.85, 1.15)),
             "object_friction_scale": float(self.rng.uniform(0.80, 1.20)),
-            "motion_noise_std": 0.035 if self.policy == "perturbed" else 0.0,
+            "motion_noise_std": (
+                (0.012 if self.definition.mode == "panda_pick_place" else 0.018)
+                if self.policy == "recovery"
+                else 0.012
+                if self.policy == "perturbed"
+                else 0.0
+            ),
+            "disturbance_profile": (
+                (
+                    "post_grasp_transport_disturbance_then_expert_recovery"
+                    if self.definition.mode == "panda_pick_place"
+                    else "approach_and_transport_disturbances_then_expert_recovery"
+                )
+                if self.policy == "recovery"
+                else "continuous_joint_command_noise_with_seeded_failure_injection"
+                if self.policy == "perturbed"
+                else "none"
+            ),
         }
         self._prepare_panda_waypoints(qpos)
 
@@ -290,7 +389,7 @@ class EmbodiedTask:
                     object_position + np.asarray([0.0, 0.0, 0.25]),
                     transit_midpoint + np.asarray([0.0, 0.0, 0.25]),
                     goal + np.asarray([0.0, 0.0, 0.22]),
-                    goal + np.asarray([0.0, 0.0, 0.028]),
+                    goal + np.asarray([0.0, 0.0, 0.038]),
                     goal + np.asarray([0.0, 0.0, 0.20]),
                 )
             if self.definition.mode == "panda_peg_insert":
@@ -619,7 +718,9 @@ class EmbodiedTask:
         stage = self._panda_stage_index()
         self.stage[:] = stage
         if self.definition.mode == "panda_peg_insert":
-            self._set_expert_grasp_constraint(3 <= stage <= 6)
+            # The disclosed expert weld only stabilizes transport. It is released before
+            # the physical insertion phase so it cannot force the peg through the socket.
+            self._set_expert_grasp_constraint(3 <= stage <= 5)
         trajectory_index = min(self.frame_id, self._panda_joint_trajectory.shape[1] - 1)
         target = np.column_stack(
             (
@@ -632,7 +733,19 @@ class EmbodiedTask:
         )
         max_delta = np.asarray([0.050] * 7 + [0.006], dtype=np.float32)
         command = current + np.clip(target - current, -max_delta, max_delta)
-        if self.policy == "perturbed":
+        if self.policy == "recovery":
+            # Short, disclosed disturbances move the robot away from the nominal
+            # trajectory. Expert control resumes with enough time to demonstrate a
+            # correction instead of turning the entire episode into a timeout.
+            in_recovery_window = (
+                230 <= self.frame_id < 240
+                if self.definition.mode == "panda_pick_place"
+                else (80 <= self.frame_id < 90) or (230 <= self.frame_id < 240)
+            )
+            if in_recovery_window:
+                noise_std = 0.012 if self.definition.mode == "panda_pick_place" else 0.018
+                command[:, :7] += self.rng.normal(0.0, noise_std, (self.nworld, 7)).astype(np.float32)
+        elif self.policy == "perturbed":
             command[:, :7] += self.rng.normal(0.0, 0.012, (self.nworld, 7)).astype(np.float32)
             if self.seed % 4 == 0 and stage == 5:
                 command[:, -1] = 0.08
@@ -782,13 +895,35 @@ class EmbodiedTask:
                 & (position[:, 2] < 0.15)
             )
         if self.definition.mode == "panda_peg_insert":
-            horizontal = np.linalg.norm(position[:, :2] - self.goal[:, :2], axis=1)
-            return (
-                (self.stage >= 6)
-                & (horizontal < self.definition.goal_radius)
-                & (position[:, 2] < 0.125)
-            )
+            reached = np.zeros(self.nworld, dtype=np.bool_)
+            for world_id in range(self.nworld):
+                contacts = self._contacts_for_world(world_id)
+                metrics = self._task_metrics_for_world(world_id, contacts)
+                reached[world_id] = (
+                    self.stage[world_id] >= 6
+                    and metrics["axial_error_m"] < min(self.definition.goal_radius, 0.012)
+                    and metrics["insertion_depth_m"] >= 0.035
+                    and metrics["maximum_target_penetration_m"] <= 0.003
+                    and metrics["object_contact_load_n"] <= 250.0
+                )
+            return reached
         return distance < self.definition.goal_radius
+
+    def _contact_type(self, geom1: int, geom2: int) -> int:
+        category1 = int(self.geom_category_ids[geom1])
+        category2 = int(self.geom_category_ids[geom2])
+        categories = {category1, category2}
+        if categories == {1, 2}:
+            return 1
+        if categories == {2, 3}:
+            return 2
+        if categories == {2, 4}:
+            return 3
+        if category1 == 1 and category2 == 1:
+            return 5
+        if 1 in categories and (3 in categories or 4 in categories):
+            return 4
+        return 0
 
     def _contacts_for_world(self, world_id: int) -> dict[str, Any]:
         count_total = int(self.data.nacon.numpy()[0])
@@ -798,12 +933,23 @@ class EmbodiedTask:
         indices = indices[:MAX_CONTACTS]
         valid = np.zeros(MAX_CONTACTS, dtype=np.bool_)
         geom_pair = np.full((MAX_CONTACTS, 2), -1, dtype=np.int32)
+        body_pair = np.full((MAX_CONTACTS, 2), -1, dtype=np.int32)
+        category_pair = np.zeros((MAX_CONTACTS, 2), dtype=np.int8)
+        type_id = np.zeros(MAX_CONTACTS, dtype=np.int8)
+        is_target = np.zeros(MAX_CONTACTS, dtype=np.bool_)
         position = np.zeros((MAX_CONTACTS, 3), dtype=np.float32)
         normal = np.zeros((MAX_CONTACTS, 3), dtype=np.float32)
         distance = np.zeros(MAX_CONTACTS, dtype=np.float32)
         if len(indices):
             valid[: len(indices)] = True
             geom_pair[: len(indices)] = self.data.contact.geom.numpy()[indices]
+            valid_pairs = geom_pair[: len(indices)]
+            body_pair[: len(indices)] = self.geom_body_ids[valid_pairs]
+            category_pair[: len(indices)] = self.geom_category_ids[valid_pairs]
+            for contact_index, (geom1, geom2) in enumerate(valid_pairs.tolist()):
+                contact_type = self._contact_type(int(geom1), int(geom2))
+                type_id[contact_index] = contact_type
+                is_target[contact_index] = contact_type in {1, 2}
             position[: len(indices)] = self.data.contact.pos.numpy()[indices]
             frames = self.data.contact.frame.numpy()[indices]
             normal[: len(indices)] = frames[:, 0, :]
@@ -812,10 +958,44 @@ class EmbodiedTask:
             "count": int(len(indices)),
             "valid": valid.tolist(),
             "geom_pair": geom_pair.tolist(),
+            "body_pair": body_pair.tolist(),
+            "category_pair": category_pair.tolist(),
+            "type_id": type_id.tolist(),
+            "is_target": is_target.tolist(),
             "position": position.tolist(),
             "normal": normal.tolist(),
             "distance": distance.tolist(),
             "overflow": bool(overflow),
+        }
+
+    def _task_metrics_for_world(
+        self, world_id: int, contacts: dict[str, Any] | None = None
+    ) -> dict[str, float]:
+        object_position = self._object_positions()[world_id]
+        axial_error = float(np.linalg.norm(object_position[:2] - self.goal[world_id, :2]))
+        insertion_depth = 0.0
+        if self.definition.mode == "panda_peg_insert" and self.insertion_entry_height > 0.0:
+            object_bottom = float(object_position[2]) - self.object_bottom_offset
+            insertion_depth = max(0.0, self.insertion_entry_height - object_bottom)
+
+        contact_data = contacts if contacts is not None else self._contacts_for_world(world_id)
+        valid = np.asarray(contact_data["valid"], dtype=np.bool_)
+        distances = np.asarray(contact_data["distance"], dtype=np.float32)
+        target = np.asarray(contact_data["type_id"], dtype=np.int8) == 2
+        target_penetrations = -distances[valid & target]
+        maximum_target_penetration = float(max(0.0, target_penetrations.max(initial=0.0)))
+
+        object_contact_load = 0.0
+        if self.object_body_id is not None:
+            wrench = np.asarray(
+                self.data.cfrc_ext.numpy()[world_id, self.object_body_id], dtype=np.float32
+            )
+            object_contact_load = float(np.linalg.norm(wrench[3:6]))
+        return {
+            "insertion_depth_m": float(insertion_depth),
+            "axial_error_m": axial_error,
+            "object_contact_load_n": object_contact_load,
+            "maximum_target_penetration_m": maximum_target_penetration,
         }
 
     def state_dict(self, control_steps_per_second: float = 0.0) -> dict[str, Any]:
@@ -842,6 +1022,8 @@ class EmbodiedTask:
             end_effector_position = body_position[self.agent_body_id]
             end_effector_quaternion = body_quaternion[self.agent_body_id]
         gripper_width = float(np.sum(joint_position[-2:])) if self.is_panda else 0.0
+        contacts = self._contacts_for_world(0)
+        task_metrics = self._task_metrics_for_world(0, contacts)
         return {
             "frame_id": self.frame_id,
             "sim_time": sim_time,
@@ -867,7 +1049,8 @@ class EmbodiedTask:
             "goal_position": self.goal[0].tolist(),
             "task_stage": int(self.stage[0]),
             "distance_to_goal": float(self.previous_distance[0]),
-            "contacts": self._contacts_for_world(0),
+            "contacts": contacts,
+            "task_metrics": task_metrics,
             "metrics": {
                 "nworld": self.nworld,
                 "success_count": int(np.count_nonzero(self.success)),
@@ -878,6 +1061,22 @@ class EmbodiedTask:
         }
 
     def episode_metadata(self) -> dict[str, Any]:
+        contact_semantics = {
+            "body_id_to_name": {str(index): name for index, name in enumerate(self.body_names)},
+            "geom_id_to_name": {str(index): name for index, name in enumerate(self.geom_names)},
+            "geom_id_to_body_id": {
+                str(index): int(body_id) for index, body_id in enumerate(self.geom_body_ids.tolist())
+            },
+            "geom_id_to_category": {
+                str(index): CONTACT_CATEGORY_NAMES[int(category)]
+                for index, category in enumerate(self.geom_category_ids.tolist())
+            },
+            "category_ids": {str(index): name for index, name in CONTACT_CATEGORY_NAMES.items()},
+            "contact_type_ids": {str(index): name for index, name in CONTACT_TYPE_NAMES.items()},
+            "object_geom_ids": self.object_geom_ids.astype(int).tolist(),
+            "object_instance_ids": (self.object_geom_ids.astype(int) + 1).tolist(),
+            "target_contact_type_ids": [1, 2],
+        }
         return {
             "robot": {
                 "id": self.robot.robot_id,
@@ -900,6 +1099,12 @@ class EmbodiedTask:
                 "control_hz": 1.0 / CONTROL_DT,
             },
             "randomization": self.randomization,
+            "contact_semantics": contact_semantics,
+            "depth_spec": {
+                "unit": "metre",
+                "invalid_depth_value": 0.0,
+                "valid_mask_dataset": "images/front_depth_valid",
+            },
         }
 
     def model_spec(self) -> dict[str, Any]:
@@ -924,10 +1129,16 @@ class EmbodiedTask:
             geom_type = geom_types.get(geom_type_id)
             if geom_type is None:
                 continue
+            geom_group = int(self.mj_model.geom_group[geom_id])
+            # Menagerie uses group 2 for visual meshes and group 3 for collision
+            # proxies. Unity must display the licensed visual assets, not the low-poly
+            # collision geometry. Task primitives remain in group 0.
+            if geom_group == 3:
+                continue
             vertices: list[list[float]] | None = None
             triangles: list[int] | None = None
             if geom_type == "mesh":
-                if int(self.mj_model.geom_group[geom_id]) != 3:
+                if geom_group not in {0, 2}:
                     continue
                 mesh_id = int(self.mj_model.geom_dataid[geom_id])
                 if mesh_id < 0:
@@ -957,6 +1168,8 @@ class EmbodiedTask:
                     "position": np.asarray(self.mj_model.geom_pos[geom_id], dtype=np.float32).tolist(),
                     "quaternion": np.asarray(self.mj_model.geom_quat[geom_id], dtype=np.float32).tolist(),
                     "rgba": rgba.tolist(),
+                    "group": geom_group,
+                    "visual_role": "licensed_visual" if geom_group == 2 else "task_geometry",
                     "vertices": vertices,
                     "triangles": triangles,
                 }
@@ -974,6 +1187,8 @@ class EmbodiedTask:
             "goal_radius": self.definition.goal_radius,
             "camera_position": list(self.definition.camera_position),
             "camera_look_at": list(self.definition.camera_look_at),
+            "camera_fov_degrees": self.definition.camera_fov_degrees,
+            "camera_near_clip_m": self.definition.camera_near_clip_m,
             "robot": self.episode_metadata()["robot"],
             "bodies": bodies,
             "geoms": geoms,

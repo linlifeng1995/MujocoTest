@@ -20,8 +20,45 @@ namespace MJWarpDemo.Tests
             Task connect = client.ConnectAsync("127.0.0.1", 8765, 10000, cancellation.Token);
             yield return Await(connect);
 
-            yield return RunPandaEpisode(client, "panda_pick_place", "unity_panda_pick_place_seed0", cancellation.Token);
-            yield return RunPandaEpisode(client, "panda_peg_insert", "unity_panda_peg_insert_seed0", cancellation.Token);
+            yield return RunPandaEpisode(client, "panda_pick_place", 0, "unity_panda_pick_place_seed0", cancellation.Token);
+            yield return RunPandaEpisode(client, "panda_peg_insert", 0, "unity_panda_peg_insert_seed0", cancellation.Token);
+
+            Task<ResponseEnvelope> shutdownTask = client.SendAsync("shutdown", null, cancellation.Token);
+            yield return Await(shutdownTask);
+            client.Dispose();
+            cancellation.Dispose();
+        }
+
+        [UnityTest]
+        [Category("MiniPilot")]
+        [Timeout(1800000)]
+        public IEnumerator PandaMiniPilotFiveSeedRoundTrip()
+        {
+            string configuredSeeds = Environment.GetEnvironmentVariable("MJWARP_MINI_PILOT_SEEDS");
+            if (string.IsNullOrWhiteSpace(configuredSeeds))
+                Assert.Ignore("Set MJWARP_MINI_PILOT_SEEDS to run the visual Mini-Pilot batch.");
+            int[] seeds = Array.ConvertAll(
+                configuredSeeds.Split(new[] { ',', ';', ' ' }, StringSplitOptions.RemoveEmptyEntries),
+                int.Parse);
+            Assert.That(seeds.Length, Is.GreaterThanOrEqualTo(1));
+
+            var cancellation = new CancellationTokenSource(TimeSpan.FromMinutes(29));
+            var client = new MjWarpClient();
+            Task connect = client.ConnectAsync("127.0.0.1", 8765, 10000, cancellation.Token);
+            yield return Await(connect);
+
+            foreach (string scenario in new[] { "panda_pick_place", "panda_peg_insert" })
+            {
+                foreach (int seed in seeds)
+                {
+                    yield return RunPandaEpisode(
+                        client,
+                        scenario,
+                        seed,
+                        $"mini_v02_{scenario}_expert_seed{seed}",
+                        cancellation.Token);
+                }
+            }
 
             Task<ResponseEnvelope> shutdownTask = client.SendAsync("shutdown", null, cancellation.Token);
             yield return Await(shutdownTask);
@@ -84,6 +121,7 @@ namespace MJWarpDemo.Tests
                     depth_b64 = Convert.ToBase64String(initialImages.Depth),
                     instance_b64 = Convert.ToBase64String(initialImages.Instance),
                     wrist_rgb_b64 = Convert.ToBase64String(initialImages.WristRgb),
+                    wrist_instance_b64 = Convert.ToBase64String(initialImages.WristInstance),
                 },
                 cancellation.Token);
             yield return Await(initialUploadTask);
@@ -101,6 +139,7 @@ namespace MJWarpDemo.Tests
             Assert.That(images.Depth.Length, Is.EqualTo(320 * 240 * 4));
             Assert.That(images.Instance.Length, Is.EqualTo(320 * 240 * 4));
             Assert.That(images.WristRgb.Length, Is.EqualTo(320 * 240 * 4));
+            Assert.That(images.WristInstance.Length, Is.EqualTo(320 * 240 * 4));
             bool hasEncodedInstanceId = false;
             for (int index = 0; index < images.Instance.Length; index += 4)
             {
@@ -122,6 +161,7 @@ namespace MJWarpDemo.Tests
                     depth_b64 = Convert.ToBase64String(images.Depth),
                     instance_b64 = Convert.ToBase64String(images.Instance),
                     wrist_rgb_b64 = Convert.ToBase64String(images.WristRgb),
+                    wrist_instance_b64 = Convert.ToBase64String(images.WristInstance),
                 },
                 cancellation.Token);
             yield return Await(uploadTask);
@@ -155,6 +195,7 @@ namespace MJWarpDemo.Tests
         private static IEnumerator RunPandaEpisode(
             MjWarpClient client,
             string scenario,
+            int seed,
             string episodeId,
             CancellationToken cancellationToken)
         {
@@ -171,12 +212,16 @@ namespace MJWarpDemo.Tests
             ModelSpec model = helloTask.Result.model_spec;
             Assert.That(model.scenario_id, Is.EqualTo(scenario));
             Assert.That(model.robot.id, Is.EqualTo("franka_panda"));
+            Assert.That(
+                Array.Exists(model.geoms, geom => geom.group == 2 && geom.visual_role == "licensed_visual"),
+                Is.True,
+                "Panda model must expose Menagerie visual meshes instead of collision proxies");
 
             camera = new GameObject($"{scenario} Front Camera").AddComponent<Camera>();
             camera.transform.position = MjWarpCoordinates.Position(model.camera_position);
             camera.transform.LookAt(MjWarpCoordinates.Position(model.camera_look_at));
-            camera.fieldOfView = 48f;
-            camera.nearClipPlane = 0.03f;
+            camera.fieldOfView = model.camera_fov_degrees;
+            camera.nearClipPlane = model.camera_near_clip_m;
             camera.farClipPlane = 4f;
             camera.clearFlags = CameraClearFlags.SolidColor;
             camera.backgroundColor = Color.black;
@@ -188,16 +233,18 @@ namespace MJWarpDemo.Tests
             Assert.That(hand, Is.Not.Null);
             wristCamera = new GameObject($"{scenario} Wrist Camera").AddComponent<Camera>();
             wristCamera.transform.SetParent(hand, false);
-            wristCamera.transform.localPosition = new Vector3(0f, 0.07f, 0f);
-            wristCamera.transform.localRotation = Quaternion.Euler(-90f, 0f, 0f);
+            wristCamera.transform.localPosition = new Vector3(0.07f, 0.08f, 0f);
+            wristCamera.transform.localRotation = Quaternion.LookRotation(
+                new Vector3(-0.07f, -0.025f, 0f).normalized,
+                Vector3.forward);
             wristCamera.enabled = false;
-            wristCamera.fieldOfView = 62f;
-            wristCamera.nearClipPlane = 0.025f;
+            wristCamera.fieldOfView = 96f;
+            wristCamera.nearClipPlane = 0.015f;
             wristCamera.farClipPlane = 2f;
             capture.SetWristSource(wristCamera);
 
             Task<ResponseEnvelope> resetTask = client.SendAsync(
-                "reset", new { scenario, seed = 0, policy = "expert", nworld = 1 }, cancellationToken);
+                "reset", new { scenario, seed, policy = "expert", nworld = 1 }, cancellationToken);
             yield return Await(resetTask);
             StateData state = resetTask.Result.state;
             visualizer.ApplyState(state);
@@ -208,12 +255,14 @@ namespace MJWarpDemo.Tests
                 {
                     scenario,
                     episode_id = episodeId,
-                    seed = 0,
+                    seed,
                     policy = "expert",
                     image_width = MultiModalCapture.Width,
                     image_height = MultiModalCapture.Height,
                     unity_version = Application.unityVersion,
                     application_version = Application.version,
+                    code_version = "mini-pilot-v0.2",
+                    schema_profile = "panda-mini-pilot-v0.2",
                     data_source = "synthetic_simulation",
                     generation_strategy = "expert_state_machine_ik",
                     license_manifest = "model/third_party/LICENSES.md",
@@ -234,12 +283,17 @@ namespace MJWarpDemo.Tests
                 client, initialCapture.Result, true, cancellationToken);
             yield return Await(initialUpload);
 
+            float maximumTargetPenetration = 0f;
             while (!state.terminated)
             {
                 Task<ResponseEnvelope> stepTask = client.SendAsync(
                     "step", new { scenario, nworld = 1 }, cancellationToken);
                 yield return Await(stepTask);
                 state = stepTask.Result.state;
+                if (state.task_metrics != null)
+                    maximumTargetPenetration = Mathf.Max(
+                        maximumTargetPenetration,
+                        state.task_metrics.maximum_target_penetration_m);
                 visualizer.ApplyState(state);
                 yield return null;
 
@@ -251,6 +305,8 @@ namespace MJWarpDemo.Tests
             }
 
             Assert.That(state.success, Is.True, $"{scenario} terminated without success at frame {state.frame_id}");
+            if (scenario == "panda_peg_insert")
+                Assert.That(maximumTargetPenetration, Is.LessThan(0.003f));
             Task<ResponseEnvelope> stopTask = client.SendAsync("record_stop", null, cancellationToken);
             yield return Await(stopTask);
             Assert.That(stopTask.Result.frame_count, Is.EqualTo(state.frame_id));
@@ -279,6 +335,7 @@ namespace MJWarpDemo.Tests
                     depth_b64 = Convert.ToBase64String(images.Depth),
                     instance_b64 = Convert.ToBase64String(images.Instance),
                     wrist_rgb_b64 = Convert.ToBase64String(images.WristRgb),
+                    wrist_instance_b64 = Convert.ToBase64String(images.WristInstance),
                 },
                 cancellationToken);
         }
@@ -311,6 +368,9 @@ namespace MJWarpDemo.Tests
                     worldRotation.x, worldRotation.y, worldRotation.z, worldRotation.w,
                 },
                 parent_frame = parentFrame,
+                vertical_fov_degrees = camera.fieldOfView,
+                near_clip_m = camera.nearClipPlane,
+                far_clip_m = camera.farClipPlane,
             };
         }
     }

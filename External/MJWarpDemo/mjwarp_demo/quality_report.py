@@ -13,6 +13,90 @@ from .validate_dataset import validate_file
 from .training.data import load_manifest
 
 
+def _json_attr(value: Any) -> dict[str, Any]:
+    if isinstance(value, bytes):
+        value = value.decode("utf-8")
+    if isinstance(value, str) and value:
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return value if isinstance(value, dict) else {}
+
+
+def _percentiles(values: np.ndarray) -> dict[str, float]:
+    values = np.asarray(values, dtype=np.float64)
+    if values.size == 0:
+        return {"p50": 0.0, "p95": 0.0, "maximum": 0.0}
+    return {
+        "p50": float(np.percentile(values, 50)),
+        "p95": float(np.percentile(values, 95)),
+        "maximum": float(np.max(values)),
+    }
+
+
+def _visibility_metrics(images: np.ndarray, instance_ids: list[int]) -> dict[str, float]:
+    images = np.asarray(images, dtype=np.uint16)
+    if images.ndim != 3 or not instance_ids:
+        return {
+            "visible_frame_rate": 0.0,
+            "bbox_within_1_to_70_percent_rate": 0.0,
+            "bbox_fraction_p50": 0.0,
+            "mean_pixel_fraction": 0.0,
+        }
+    bbox_fractions: list[float] = []
+    pixel_fractions: list[float] = []
+    within = 0
+    for frame in images:
+        mask = np.isin(frame, instance_ids)
+        pixel_fraction = float(np.mean(mask))
+        pixel_fractions.append(pixel_fraction)
+        if not np.any(mask):
+            bbox_fractions.append(0.0)
+            continue
+        rows, columns = np.nonzero(mask)
+        bbox_fraction = float(
+            (rows.max() - rows.min() + 1)
+            * (columns.max() - columns.min() + 1)
+            / frame.size
+        )
+        bbox_fractions.append(bbox_fraction)
+        within += int(0.01 <= bbox_fraction <= 0.70)
+    bbox_array = np.asarray(bbox_fractions, dtype=np.float64)
+    return {
+        "visible_frame_rate": float(np.mean(bbox_array > 0.0)),
+        "bbox_within_1_to_70_percent_rate": float(within / len(images)),
+        "bbox_fraction_p50": float(np.percentile(bbox_array, 50)),
+        "mean_pixel_fraction": float(np.mean(pixel_fractions)),
+    }
+
+
+def _visibility_by_stage(
+    images: np.ndarray, instance_ids: list[int], stages: np.ndarray
+) -> dict[str, dict[str, float]]:
+    return {
+        str(stage): _visibility_metrics(images[stages == stage], instance_ids)
+        for stage in np.unique(stages).tolist()
+    }
+
+
+def _manipulation_visibility_passed(
+    episode: dict[str, Any], *, minimum_visible_rate: float = 0.95
+) -> bool:
+    by_stage = episode.get("wrist_target_visibility_by_stage", {})
+    manipulation_stages = [
+        metrics
+        for stage, metrics in by_stage.items()
+        if int(stage) >= 2
+    ]
+    return bool(manipulation_stages) and all(
+        metrics.get("visible_frame_rate", 0.0) >= minimum_visible_rate
+        and metrics.get("bbox_within_1_to_70_percent_rate", 0.0) >= minimum_visible_rate
+        for metrics in manipulation_stages
+    )
+
+
 def episode_metrics(path: Path) -> dict[str, Any]:
     errors = validate_file(path)
     with h5py.File(path, "r") as episode:
@@ -20,6 +104,56 @@ def episode_metrics(path: Path) -> dict[str, Any]:
         contacts = np.asarray(episode["contacts/count"], dtype=np.int32)
         valid = np.asarray(episode["contacts/valid"], dtype=np.bool_)
         penetration = np.asarray(episode["contacts/distance"], dtype=np.float32)
+        contact_overflow = np.asarray(episode["contacts/overflow"], dtype=np.bool_)
+        penetrations = np.maximum(0.0, -penetration[valid])
+        target_penetrations = np.asarray([], dtype=np.float32)
+        if "contacts/type_id" in episode:
+            contact_types = np.asarray(episode["contacts/type_id"], dtype=np.int8)
+            target_penetrations = np.maximum(0.0, -penetration[valid & (contact_types == 2)])
+        actions = np.asarray(episode["actions/normalized"], dtype=np.float32)
+        saturation_by_dimension = (
+            np.mean(np.abs(actions) >= 0.999, axis=0) if len(actions) else np.zeros(0)
+        )
+        depth = np.asarray(episode["images/front_depth_m"], dtype=np.float32)
+        depth_valid = (
+            np.asarray(episode["images/front_depth_valid"], dtype=np.bool_)
+            if "images/front_depth_valid" in episode
+            else np.isfinite(depth) & (depth > 0.0)
+        )
+        contact_semantics = _json_attr(episode.attrs.get("contact_semantics", ""))
+        object_instance_ids = [int(value) for value in contact_semantics.get("object_instance_ids", [])]
+        front_instances = np.asarray(episode["images/front_instance_id"], dtype=np.uint16)
+        wrist_instances = (
+            np.asarray(episode["images/wrist_instance_id"], dtype=np.uint16)
+            if "images/wrist_instance_id" in episode
+            else None
+        )
+        front_visibility = _visibility_metrics(front_instances, object_instance_ids)
+        wrist_visibility = (
+            _visibility_metrics(wrist_instances, object_instance_ids)
+            if wrist_instances is not None
+            else {}
+        )
+        control_dt = float(episode.attrs.get("control_dt", 0.05))
+        stages = np.asarray(episode["observations/task_stage"], dtype=np.int16)
+        stage_durations = {
+            str(stage): float(np.count_nonzero(stages == stage) * control_dt)
+            for stage in np.unique(stages).tolist()
+        }
+        task_metrics = {}
+        for name in (
+            "insertion_depth_m",
+            "axial_error_m",
+            "object_contact_load_n",
+            "maximum_target_penetration_m",
+        ):
+            dataset_name = f"task_metrics/{name}"
+            if dataset_name in episode:
+                values = np.asarray(episode[dataset_name], dtype=np.float32)
+                task_metrics[name] = {
+                    "final": float(values[-1]),
+                    **_percentiles(values),
+                }
         return {
             "path": str(path.resolve()),
             "schema_version": str(episode.attrs.get("schema_version", "")),
@@ -32,7 +166,26 @@ def episode_metrics(path: Path) -> dict[str, Any]:
             "transitions": int(episode.attrs.get("transition_count", 0)),
             "duration_seconds": float(timestamps[-1] - timestamps[0]) if len(timestamps) > 1 else 0.0,
             "max_contact_count": int(contacts.max(initial=0)),
-            "maximum_penetration_m": float(max(0.0, -penetration[valid].min(initial=0.0))),
+            "contact_overflow_frames": int(np.count_nonzero(contact_overflow)),
+            "contact_penetration_m": _percentiles(penetrations),
+            "target_contact_penetration_m": _percentiles(target_penetrations),
+            "maximum_penetration_m": float(penetrations.max(initial=0.0)),
+            "action_saturation_rate_by_dimension": saturation_by_dimension.astype(float).tolist(),
+            "arm_action_saturation_max": float(saturation_by_dimension[:-1].max(initial=0.0)),
+            "depth_invalid_fraction": float(1.0 - np.mean(depth_valid)),
+            "front_target_visibility": front_visibility,
+            "wrist_target_visibility": wrist_visibility,
+            "front_target_visibility_by_stage": _visibility_by_stage(
+                front_instances, object_instance_ids, stages
+            ),
+            "wrist_target_visibility_by_stage": (
+                _visibility_by_stage(wrist_instances, object_instance_ids, stages)
+                if wrist_instances is not None
+                else {}
+            ),
+            "stage_duration_seconds": stage_durations,
+            "task_metrics": task_metrics,
+            "file_size_bytes": int(path.stat().st_size),
             "validation_errors": errors,
             "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
         }
@@ -96,6 +249,31 @@ def build_quality_report(
         },
         "policy_distribution": _distribution(episodes, "policy"),
         "termination_reason_distribution": _distribution(episodes, "termination_reason"),
+        "quality_gates": {
+            "validator_passed": all(not item["validation_errors"] for item in episodes),
+            "contact_overflow_zero": all(item["contact_overflow_frames"] == 0 for item in episodes),
+            "arm_action_saturation_below_5_percent": all(
+                item["arm_action_saturation_max"] < 0.05 for item in episodes
+            ),
+            "insertion_target_penetration_below_3mm": all(
+                item["task_name"] != "panda_peg_insert"
+                or item["target_contact_penetration_m"]["maximum"] < 0.003
+                for item in episodes
+            ),
+            "target_visible_in_both_cameras": all(
+                item["front_target_visibility"]["visible_frame_rate"] > 0.0
+                and item["wrist_target_visibility"].get("visible_frame_rate", 0.0) > 0.0
+                for item in episodes
+            ),
+            "front_target_reviewable": all(
+                item["front_target_visibility"]["visible_frame_rate"] >= 0.95
+                and item["front_target_visibility"]["bbox_within_1_to_70_percent_rate"] >= 0.15
+                for item in episodes
+            ),
+            "wrist_target_reviewable_during_manipulation": all(
+                _manipulation_visibility_passed(item) for item in episodes
+            ),
+        },
         "episodes": episodes,
     }
     if manifest_path is not None:

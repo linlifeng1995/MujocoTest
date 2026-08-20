@@ -16,10 +16,12 @@ namespace MJWarpDemo
         private readonly Camera depthCamera;
         private readonly Camera instanceCamera;
         private readonly Camera wristRgbCamera;
+        private readonly Camera wristInstanceCamera;
         private readonly RenderTexture rgbTexture;
         private readonly RenderTexture depthTexture;
         private readonly RenderTexture instanceTexture;
         private readonly RenderTexture wristRgbTexture;
+        private readonly RenderTexture wristInstanceTexture;
         private readonly Material depthMaterial;
         private IReadOnlyList<RendererBinding> bindings = Array.Empty<RendererBinding>();
         private Camera wristSourceCamera;
@@ -35,15 +37,18 @@ namespace MJWarpDemo
             depthCamera = CreateCamera("MJWarp Depth Capture");
             instanceCamera = CreateCamera("MJWarp Instance Capture");
             wristRgbCamera = CreateCamera("MJWarp Wrist RGB Capture");
+            wristInstanceCamera = CreateCamera("MJWarp Wrist Instance Capture");
 
             rgbTexture = CreateTexture("MJWarp RGB", RenderTextureFormat.ARGB32, RenderTextureReadWrite.sRGB, 24);
             depthTexture = CreateTexture("MJWarp Linear Depth", RenderTextureFormat.RFloat, RenderTextureReadWrite.Linear, 24);
             instanceTexture = CreateTexture("MJWarp Instance", RenderTextureFormat.ARGB32, RenderTextureReadWrite.Linear, 24);
             wristRgbTexture = CreateTexture("MJWarp Wrist RGB", RenderTextureFormat.ARGB32, RenderTextureReadWrite.sRGB, 24);
+            wristInstanceTexture = CreateTexture("MJWarp Wrist Instance", RenderTextureFormat.ARGB32, RenderTextureReadWrite.Linear, 24);
             rgbCamera.targetTexture = rgbTexture;
             depthCamera.targetTexture = depthTexture;
             instanceCamera.targetTexture = instanceTexture;
             wristRgbCamera.targetTexture = wristRgbTexture;
+            wristInstanceCamera.targetTexture = wristInstanceTexture;
 
             Shader depthShader = Shader.Find("MJWarp/LinearDepth");
             if (depthShader == null)
@@ -67,21 +72,33 @@ namespace MJWarpDemo
             SyncCamera(depthCamera, sourceCamera);
             SyncCamera(instanceCamera, sourceCamera);
             SyncCamera(wristRgbCamera, wristSourceCamera != null ? wristSourceCamera : sourceCamera);
+            SyncCamera(wristInstanceCamera, wristSourceCamera != null ? wristSourceCamera : sourceCamera);
 
-            rgbCamera.Render();
-            wristRgbCamera.Render();
-            SwapMaterials(depthMaterial, false);
-            depthCamera.Render();
-            RestoreMaterials();
-            SwapMaterials(null, true);
-            instanceCamera.Render();
-            RestoreMaterials();
+            SetAnnotationsVisible(false);
+            try
+            {
+                rgbCamera.Render();
+                wristRgbCamera.Render();
+                SwapMaterials(depthMaterial, false);
+                depthCamera.Render();
+                RestoreMaterials();
+                SwapMaterials(null, true);
+                instanceCamera.Render();
+                wristInstanceCamera.Render();
+                RestoreMaterials();
+            }
+            finally
+            {
+                RestoreMaterials();
+                SetAnnotationsVisible(true);
+            }
 
             Task<byte[]> rgb = ReadbackAsync(rgbTexture, TextureFormat.RGBA32);
             Task<byte[]> depth = ReadbackAsync(depthTexture, TextureFormat.RFloat);
             Task<byte[]> instance = ReadbackAsync(instanceTexture, TextureFormat.RGBA32);
             Task<byte[]> wristRgb = ReadbackAsync(wristRgbTexture, TextureFormat.RGBA32);
-            await Task.WhenAll(rgb, depth, instance, wristRgb);
+            Task<byte[]> wristInstance = ReadbackAsync(wristInstanceTexture, TextureFormat.RGBA32);
+            await Task.WhenAll(rgb, depth, instance, wristRgb, wristInstance);
             return new CapturePayload
             {
                 FrameId = frameId,
@@ -89,6 +106,7 @@ namespace MJWarpDemo
                 Depth = depth.Result,
                 Instance = instance.Result,
                 WristRgb = wristRgb.Result,
+                WristInstance = wristInstance.Result,
             };
         }
 
@@ -108,6 +126,15 @@ namespace MJWarpDemo
             {
                 if (binding.Renderer != null)
                     binding.Renderer.sharedMaterial = binding.OriginalMaterial;
+            }
+        }
+
+        private void SetAnnotationsVisible(bool visible)
+        {
+            foreach (RendererBinding binding in bindings)
+            {
+                if (binding.IsAnnotation && binding.Renderer != null)
+                    binding.Renderer.enabled = visible;
             }
         }
 
@@ -170,10 +197,12 @@ namespace MJWarpDemo
             DestroyCamera(depthCamera);
             DestroyCamera(instanceCamera);
             DestroyCamera(wristRgbCamera);
+            DestroyCamera(wristInstanceCamera);
             DestroyTexture(rgbTexture);
             DestroyTexture(depthTexture);
             DestroyTexture(instanceTexture);
             DestroyTexture(wristRgbTexture);
+            DestroyTexture(wristInstanceTexture);
         }
 
         private static void DestroyCamera(Camera camera)

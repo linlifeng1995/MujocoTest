@@ -178,6 +178,9 @@ class EpisodeRecorder:
         wrist_rgb = self._decode_rgba(capture.get("wrist_rgb_b64", capture["rgb_b64"]))[..., :3]
         depth = self._decode_depth(capture["depth_b64"])
         instance = self._decode_instance(capture["instance_b64"])
+        wrist_instance = self._decode_instance(
+            capture.get("wrist_instance_b64", capture["instance_b64"])
+        )
         fields: tuple[tuple[str, Any, Any], ...] = (
             ("timestamps", state["sim_time"], np.float64),
             ("frame_id", state["frame_id"], np.int64),
@@ -204,6 +207,10 @@ class EpisodeRecorder:
             ("contacts/count", contacts["count"], np.int16),
             ("contacts/valid", contacts["valid"], np.bool_),
             ("contacts/geom_pair", contacts["geom_pair"], np.int32),
+            ("contacts/body_pair", contacts.get("body_pair", np.full((MAX_CONTACTS, 2), -1)), np.int32),
+            ("contacts/category_pair", contacts.get("category_pair", np.zeros((MAX_CONTACTS, 2))), np.int8),
+            ("contacts/type_id", contacts.get("type_id", np.zeros(MAX_CONTACTS)), np.int8),
+            ("contacts/is_target", contacts.get("is_target", np.zeros(MAX_CONTACTS)), np.bool_),
             ("contacts/position", contacts["position"], np.float32),
             ("contacts/normal", contacts["normal"], np.float32),
             ("contacts/distance", contacts["distance"], np.float32),
@@ -211,10 +218,25 @@ class EpisodeRecorder:
         ):
             self._append_at(name, index, value, dtype=dtype)
 
+        task_metrics = state.get("task_metrics", {})
+        for name in (
+            "insertion_depth_m",
+            "axial_error_m",
+            "object_contact_load_n",
+            "maximum_target_penetration_m",
+        ):
+            self._append_at(
+                f"task_metrics/{name}", index, float(task_metrics.get(name, 0.0)), dtype=np.float32
+            )
+
         self._append_at("images/front_rgb", index, rgb, compression=True)
         self._append_at("images/front_depth_m", index, depth.astype(np.float16), compression=True)
+        self._append_at(
+            "images/front_depth_valid", index, np.isfinite(depth) & (depth > 0.0), compression=True
+        )
         self._append_at("images/front_instance_id", index, instance, compression=True)
         self._append_at("images/wrist_rgb", index, wrist_rgb, compression=True)
+        self._append_at("images/wrist_instance_id", index, wrist_instance, compression=True)
         self.observation_count += 1
 
     @staticmethod

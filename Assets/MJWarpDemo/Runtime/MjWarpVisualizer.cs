@@ -12,6 +12,7 @@ namespace MJWarpDemo
         public Material InstanceMaterial;
         public int InstanceId;
         public Color BaseColor;
+        public bool IsAnnotation;
     }
 
     public sealed class MjWarpVisualizer : IDisposable
@@ -202,6 +203,7 @@ namespace MJWarpDemo
                 InstanceMaterial = instance,
                 InstanceId = 65534,
                 BaseColor = rgb.color,
+                IsAnnotation = true,
             });
             goalTransform = goal.transform;
         }

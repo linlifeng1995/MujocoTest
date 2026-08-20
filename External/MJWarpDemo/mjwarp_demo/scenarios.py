@@ -46,6 +46,8 @@ class ScenarioDefinition:
     camera_position: tuple[float, float, float]
     camera_look_at: tuple[float, float, float]
     official_reference: str
+    camera_fov_degrees: float = 48.0
+    camera_near_clip_m: float = 0.03
 
     def model_path(self, package_root: Path) -> Path:
         return package_root / "model" / self.model_file
@@ -220,9 +222,10 @@ SCENARIOS: dict[str, ScenarioDefinition] = {
         torque_limit=100.0,
         progress_scale=4.0,
         max_frames=470,
-        camera_position=(1.18, -1.15, 0.92),
-        camera_look_at=(0.48, 0.0, 0.20),
+        camera_position=(0.95, -0.58, 0.68),
+        camera_look_at=(0.50, 0.0, 0.15),
         official_reference="DROID / robomimic Lift and Can / MimicGen Stack",
+        camera_fov_degrees=34.0,
     ),
     "panda_peg_insert": ScenarioDefinition(
         scenario_id="panda_peg_insert",
@@ -236,14 +239,15 @@ SCENARIOS: dict[str, ScenarioDefinition] = {
         object_joint="peg_free",
         object_body="peg",
         goal_radius=0.025,
-        success_frames=5,
+        success_frames=2,
         max_speed=1.0,
         torque_limit=100.0,
         progress_scale=6.0,
         max_frames=520,
-        camera_position=(1.12, -1.08, 0.88),
-        camera_look_at=(0.52, 0.02, 0.18),
+        camera_position=(0.93, -0.56, 0.66),
+        camera_look_at=(0.51, 0.02, 0.15),
         official_reference="MimicGen Square / Isaac Factory peg insertion",
+        camera_fov_degrees=34.0,
     ),
 }
 

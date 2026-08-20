@@ -303,6 +303,8 @@ namespace MJWarpDemo
                         image_height = MultiModalCapture.Height,
                         unity_version = Application.unityVersion,
                         application_version = Application.version,
+                        code_version = "mini-pilot-v0.2",
+                        schema_profile = "panda-mini-pilot-v0.2",
                         data_source = "synthetic_simulation",
                         generation_strategy = policy,
                         license_manifest = "model/third_party/LICENSES.md",
@@ -329,6 +331,7 @@ namespace MJWarpDemo
                         depth_b64 = Convert.ToBase64String(initialImages.Depth),
                         instance_b64 = Convert.ToBase64String(initialImages.Instance),
                         wrist_rgb_b64 = Convert.ToBase64String(initialImages.WristRgb),
+                        wrist_instance_b64 = Convert.ToBase64String(initialImages.WristInstance),
                     },
                     lifetimeCancellation.Token);
             }
@@ -360,6 +363,7 @@ namespace MJWarpDemo
                                 depth_b64 = Convert.ToBase64String(images.Depth),
                                 instance_b64 = Convert.ToBase64String(images.Instance),
                                 wrist_rgb_b64 = Convert.ToBase64String(images.WristRgb),
+                                wrist_instance_b64 = Convert.ToBase64String(images.WristInstance),
                             },
                             lifetimeCancellation.Token);
                     }
@@ -487,6 +491,10 @@ namespace MJWarpDemo
                 baseCameraPosition = MjWarpCoordinates.Position(spec.camera_position);
             if (spec?.camera_look_at != null && spec.camera_look_at.Length >= 3)
                 baseCameraLookAt = MjWarpCoordinates.Position(spec.camera_look_at);
+            if (spec != null && spec.camera_fov_degrees > 0f)
+                mainCamera.fieldOfView = spec.camera_fov_degrees;
+            if (spec != null && spec.camera_near_clip_m > 0f)
+                mainCamera.nearClipPlane = spec.camera_near_clip_m;
             mainCamera.transform.position = baseCameraPosition;
             mainCamera.transform.LookAt(baseCameraLookAt);
         }
@@ -506,12 +514,17 @@ namespace MJWarpDemo
                 return;
             var cameraObject = new GameObject("Panda Wrist Camera");
             cameraObject.transform.SetParent(hand, false);
-            cameraObject.transform.localPosition = new Vector3(0f, 0.07f, 0f);
-            cameraObject.transform.localRotation = Quaternion.Euler(-90f, 0f, 0f);
+            // Mount the camera beside the gripper instead of on the hand centreline.
+            // A centreline camera is occluded by link7 behind the hand, while the old
+            // forward mount moved past the object as soon as the fingers closed.
+            cameraObject.transform.localPosition = new Vector3(0.07f, 0.08f, 0f);
+            cameraObject.transform.localRotation = Quaternion.LookRotation(
+                new Vector3(-0.07f, -0.025f, 0f).normalized,
+                Vector3.forward);
             wristCamera = cameraObject.AddComponent<Camera>();
             wristCamera.enabled = false;
-            wristCamera.fieldOfView = 62f;
-            wristCamera.nearClipPlane = 0.025f;
+            wristCamera.fieldOfView = 96f;
+            wristCamera.nearClipPlane = 0.015f;
             wristCamera.farClipPlane = 2.0f;
             capture?.SetWristSource(wristCamera);
         }
@@ -538,6 +551,9 @@ namespace MJWarpDemo
                 position_unity_world = new[] { worldPosition.x, worldPosition.y, worldPosition.z },
                 quaternion_unity_world_xyzw = new[] { worldRotation.x, worldRotation.y, worldRotation.z, worldRotation.w },
                 parent_frame = parentFrame,
+                vertical_fov_degrees = camera.fieldOfView,
+                near_clip_m = camera.nearClipPlane,
+                far_clip_m = camera.farClipPlane,
             };
         }
 
