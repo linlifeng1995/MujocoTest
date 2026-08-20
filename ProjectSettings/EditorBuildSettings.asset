@@ -17,6 +17,12 @@ EditorBuildSettings:
   - enabled: 1
     path: Assets/Scenes/WarehouseNavigationScene.unity
     guid: c43833d4a9734ea7b584dd369c8a5590
+  - enabled: 1
+    path: Assets/Scenes/PandaPickPlaceScene.unity
+    guid: 5e43ac48f51b4d6b8ca6fe8f6d9c9311
+  - enabled: 1
+    path: Assets/Scenes/PandaPegInsertScene.unity
+    guid: d5eeb74413d74225a72d235c853a74d2
   m_configObjects:
     com.unity.input.settings.actions: {fileID: -944628639613478452, guid: 052faaac586de48259a63d0c4782560b, type: 3}
   m_UseUCBPForAssetBundles: 0

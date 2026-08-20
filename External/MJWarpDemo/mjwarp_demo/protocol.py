@@ -5,7 +5,7 @@ import json
 import struct
 from typing import Any
 
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 3
 MAX_MESSAGE_BYTES = 64 * 1024 * 1024
 
 

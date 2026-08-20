@@ -1,0 +1,44 @@
+<mujoco model="panda peg insertion pilot">
+  <include file="mjx_panda.xml"/>
+
+  <option timestep="0.005" gravity="0 0 -9.81" integrator="implicitfast" solver="Newton" iterations="12" ls_iterations="10">
+    <flag eulerdamp="disable"/>
+  </option>
+  <size njmax="512" nconmax="160"/>
+
+  <contact>
+    <pair geom1="peg_geom" geom2="left_finger_pad" condim="4" friction="8 0.08 0.002 0.0001 0.0001"
+      solref="0.002 1" solimp="0.99 0.999 0.0001"/>
+    <pair geom1="peg_geom" geom2="right_finger_pad" condim="4" friction="8 0.08 0.002 0.0001 0.0001"
+      solref="0.002 1" solimp="0.99 0.999 0.0001"/>
+  </contact>
+
+  <equality>
+    <weld name="expert_grasp_weld" body1="hand" body2="peg" active="false"
+      solref="0.003 1" solimp="0.95 0.999 0.001"/>
+  </equality>
+
+  <worldbody>
+    <light name="key" pos="0.4 -0.4 1.6" dir="0.1 0.2 -1" directional="true"/>
+    <geom name="floor" type="plane" size="1.5 1.2 0.05" rgba="0.10 0.12 0.15 1" friction="1.0 0.02 0.001"/>
+    <geom name="table" type="box" pos="0.52 0 0.025" size="0.46 0.42 0.025"
+      rgba="0.30 0.34 0.38 1" friction="1.1 0.02 0.001"/>
+
+    <body name="peg" pos="0.43 -0.14 0.105">
+      <freejoint name="peg_free"/>
+      <geom name="peg_geom" type="cylinder" size="0.012 0.055" density="850"
+        rgba="0.95 0.55 0.08 1" friction="1.0 0.02 0.001"/>
+      <geom name="peg_grasp_geom" type="cylinder" pos="0 0 0.035" size="0.020 0.012" density="300"
+        rgba="1.0 0.72 0.12 1" friction="2.0 0.03 0.001"/>
+    </body>
+
+    <body name="socket" pos="0.60 0.14 0.058">
+      <geom name="socket_base" type="box" size="0.07 0.07 0.008" rgba="0.16 0.48 0.86 1"/>
+      <geom name="socket_left" type="box" pos="0 0.030 0.025" size="0.035 0.012 0.025" rgba="0.12 0.38 0.75 1"/>
+      <geom name="socket_right" type="box" pos="0 -0.030 0.025" size="0.035 0.012 0.025" rgba="0.12 0.38 0.75 1"/>
+      <geom name="socket_front" type="box" pos="0.030 0 0.025" size="0.012 0.018 0.025" rgba="0.12 0.38 0.75 1"/>
+      <geom name="socket_back" type="box" pos="-0.030 0 0.025" size="0.012 0.018 0.025" rgba="0.12 0.38 0.75 1"/>
+      <site name="goal_site" pos="0 0 0.018" size="0.008" rgba="0.2 1 0.3 0.35"/>
+    </body>
+  </worldbody>
+</mujoco>

@@ -1,0 +1,37 @@
+<mujoco model="panda pick place pilot">
+  <include file="mjx_panda.xml"/>
+
+  <option timestep="0.005" gravity="0 0 -9.81" integrator="implicitfast" solver="Newton" iterations="8" ls_iterations="8">
+    <flag eulerdamp="disable"/>
+  </option>
+  <size njmax="512" nconmax="128"/>
+
+  <contact>
+    <pair geom1="object_geom" geom2="left_finger_pad" condim="4" friction="4 0.05 0.001 0.0001 0.0001"
+      solref="0.002 1" solimp="0.99 0.999 0.0001"/>
+    <pair geom1="object_geom" geom2="right_finger_pad" condim="4" friction="4 0.05 0.001 0.0001 0.0001"
+      solref="0.002 1" solimp="0.99 0.999 0.0001"/>
+  </contact>
+
+  <worldbody>
+    <light name="key" pos="0.4 -0.4 1.6" dir="0.1 0.2 -1" directional="true"/>
+    <geom name="floor" type="plane" size="1.5 1.2 0.05" rgba="0.10 0.12 0.15 1" friction="1.0 0.02 0.001"/>
+    <geom name="table" type="box" pos="0.52 0 0.025" size="0.46 0.42 0.025"
+      rgba="0.30 0.34 0.38 1" friction="1.1 0.02 0.001"/>
+
+    <body name="object" pos="0.45 -0.12 0.075">
+      <freejoint name="object_free"/>
+      <geom name="object_geom" type="box" size="0.025 0.025 0.025" density="550"
+        rgba="0.90 0.20 0.12 1" friction="1.0 0.02 0.001"/>
+    </body>
+
+    <body name="bin" pos="0.62 0.16 0.055">
+      <geom name="bin_floor" type="box" size="0.09 0.09 0.008" rgba="0.10 0.65 0.28 1"/>
+      <geom name="bin_wall_left" type="box" pos="0 0.095 0.035" size="0.10 0.008 0.04" rgba="0.12 0.55 0.26 1"/>
+      <geom name="bin_wall_right" type="box" pos="0 -0.095 0.035" size="0.10 0.008 0.04" rgba="0.12 0.55 0.26 1"/>
+      <geom name="bin_wall_front" type="box" pos="0.095 0 0.035" size="0.008 0.10 0.04" rgba="0.12 0.55 0.26 1"/>
+      <geom name="bin_wall_back" type="box" pos="-0.095 0 0.035" size="0.008 0.10 0.04" rgba="0.12 0.55 0.26 1"/>
+      <site name="goal_site" pos="0 0 0.035" size="0.012" rgba="0.2 1 0.3 0.35"/>
+    </body>
+  </worldbody>
+</mujoco>

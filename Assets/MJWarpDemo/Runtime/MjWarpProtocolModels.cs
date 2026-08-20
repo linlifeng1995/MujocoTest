@@ -20,6 +20,11 @@ namespace MJWarpDemo
         public int frame_count;
         public BenchmarkResult[] results;
         public ScenarioSummary[] scenarios;
+        public ModelArtifactInfo[] models;
+        public string loaded_model;
+        public string unloaded_model;
+        public LoadedModelInfo model_info;
+        public InferenceInfo inference;
     }
 
     [Serializable]
@@ -47,8 +52,22 @@ namespace MJWarpDemo
         public float goal_radius;
         public float[] camera_position;
         public float[] camera_look_at;
+        public RobotSpec robot;
         public BodySpec[] bodies;
         public GeomSpec[] geoms;
+    }
+
+    [Serializable]
+    public sealed class RobotSpec
+    {
+        public string id;
+        public string display_name;
+        public string[] controlled_joint_names;
+        public string[] gripper_joint_names;
+        public string end_effector_body;
+        public string end_effector_site;
+        public string model_source;
+        public string model_license;
     }
 
     [Serializable]
@@ -78,6 +97,8 @@ namespace MJWarpDemo
         public float[] position;
         public float[] quaternion;
         public float[] rgba;
+        public float[][] vertices;
+        public int[] triangles;
     }
 
     [Serializable]
@@ -86,15 +107,24 @@ namespace MJWarpDemo
         public int frame_id;
         public double sim_time;
         public string scenario_id;
+        public string robot_id;
         public float[] qpos;
         public float[] qvel;
+        public float[] joint_position;
+        public float[] joint_velocity;
+        public float[] joint_effort;
+        public float[] end_effector_position;
+        public float[] end_effector_quaternion;
+        public float gripper_width;
         public float[][] body_position;
         public float[][] body_quaternion;
         public float[][] body_external_wrench;
         public float[] action;
+        public float[] action_command;
         public float reward;
         public bool terminated;
         public bool success;
+        public string termination_reason;
         public float[] goal_position;
         public int task_stage;
         public float distance_to_goal;
@@ -136,11 +166,44 @@ namespace MJWarpDemo
         public string error;
     }
 
+    [Serializable]
+    public sealed class ModelArtifactInfo
+    {
+        public string artifact_id;
+        public string scenario;
+        public string model_type;
+        public string created_utc;
+        public int input_dim;
+        public int action_dim;
+        public float validation_mse;
+    }
+
+    [Serializable]
+    public sealed class LoadedModelInfo
+    {
+        public string artifact_id;
+        public string scenario;
+        public string device;
+        public int input_dim;
+        public int action_dim;
+    }
+
+    [Serializable]
+    public sealed class InferenceInfo
+    {
+        public string artifact_id;
+        public float latency_ms;
+        public bool blocked;
+        public string error;
+        public float[] action;
+    }
+
     public sealed class CapturePayload
     {
         public int FrameId;
         public byte[] Rgb;
         public byte[] Depth;
         public byte[] Instance;
+        public byte[] WristRgb;
     }
 }

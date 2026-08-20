@@ -27,6 +27,7 @@ namespace MJWarpDemo
         private MultiModalCapture capture;
         private Process backendProcess;
         private Camera mainCamera;
+        private Camera wristCamera;
         private Light keyLight;
         private Font chineseFont;
         private MjWarpScenarioInfo scenario;
@@ -34,13 +35,21 @@ namespace MJWarpDemo
         private StateData currentState;
         private BackendInfo backendInfo;
         private BenchmarkResult[] benchmarkResults;
+        private ModelArtifactInfo[] availableModels = Array.Empty<ModelArtifactInfo>();
+        private LoadedModelInfo loadedModel;
+        private InferenceInfo lastInference;
         private string status = "正在启动";
         private string selectedPolicy = "expert";
         private string seedText = "0";
+        private string batchCountText = "20";
+        private string batchSummary = "";
         private string lastDatasetPath = "";
+        private float episodeTotalReward;
+        private int selectedModelIndex;
         private bool recordEpisode = true;
         private bool busy;
         private bool stopRequested;
+        private Vector2 panelScroll;
         private Vector2 logScroll;
         private Vector3 baseCameraPosition = new Vector3(-0.02f, 0.86f, -0.88f);
         private Vector3 baseCameraLookAt = new Vector3(-0.04f, 0.035f, 0f);
@@ -146,10 +155,13 @@ namespace MJWarpDemo
                     lifetimeCancellation.Token);
                 backendInfo = hello.backend;
                 modelSpec = hello.model_spec;
+                availableModels = hello.models ?? Array.Empty<ModelArtifactInfo>();
+                selectedModelIndex = Mathf.Clamp(selectedModelIndex, 0, Math.Max(0, availableModels.Length - 1));
                 scenario = MjWarpScenarioCatalog.FindById(modelSpec.scenario_id);
                 ApplyModelPresentation(modelSpec);
                 visualizer.Build(modelSpec);
                 capture.SetBindings(visualizer.RendererBindings);
+                ConfigureWristCamera(modelSpec);
                 ResponseEnvelope reset = await client.SendAsync(
                     "reset",
                     new { seed = CurrentSeed, policy = selectedPolicy, nworld = 1, scenario = scenario.ScenarioId },
@@ -214,22 +226,54 @@ namespace MJWarpDemo
 
         private async void RunSingleEpisode()
         {
-            await RunOperation(async () => await RunEpisodeAsync(selectedPolicy, CurrentSeed, recordEpisode));
+            await RunOperation(async () => { await RunEpisodeAsync(selectedPolicy, CurrentSeed, recordEpisode); });
         }
 
-        private async void GenerateAcceptanceSet()
+        private async void GenerateBatchSet()
         {
             await RunOperation(async () =>
             {
                 int baseSeed = CurrentSeed;
-                for (int index = 0; index < 10 && !stopRequested; index++)
-                    await RunEpisodeAsync("expert", baseSeed + index, true);
-                for (int index = 0; index < 10 && !stopRequested; index++)
-                    await RunEpisodeAsync("random", baseSeed + 100 + index, true);
+                int count = CurrentBatchCount;
+                int completed = 0;
+                int succeeded = 0;
+                for (int index = 0; index < count && !stopRequested; index++)
+                {
+                    if (await RunEpisodeAsync(selectedPolicy, baseSeed + index, recordEpisode))
+                        succeeded++;
+                    completed++;
+                    batchSummary = $"批量进度 {completed}/{count}｜成功 {succeeded}｜失败 {completed - succeeded}";
+                }
+                batchSummary = $"批量完成 {completed}/{count}｜成功 {succeeded}｜失败 {completed - succeeded}";
             });
         }
 
-        private async Task RunEpisodeAsync(string policy, int seed, bool record)
+        private async void GenerateStandardDataset()
+        {
+            await RunOperation(async () =>
+            {
+                int baseSeed = CurrentSeed;
+                int completed = 0;
+                int succeeded = 0;
+                foreach (var batch in new[]
+                {
+                    new { Policy = "expert", Count = 375, Offset = 0 },
+                    new { Policy = "perturbed", Count = 125, Offset = 100000 },
+                })
+                {
+                    for (int index = 0; index < batch.Count && !stopRequested; index++)
+                    {
+                        if (await RunEpisodeAsync(batch.Policy, baseSeed + batch.Offset + index, true))
+                            succeeded++;
+                        completed++;
+                        batchSummary = $"当前任务 Pilot {completed}/500｜成功 {succeeded}｜失败 {completed - succeeded}";
+                    }
+                }
+                batchSummary = $"当前任务 Pilot 完成 {completed}/500｜成功 {succeeded}｜失败 {completed - succeeded}";
+            });
+        }
+
+        private async Task<bool> RunEpisodeAsync(string policy, int seed, bool record)
         {
             if (!client.IsConnected)
                 await ConnectBackendAsync();
@@ -242,6 +286,8 @@ namespace MJWarpDemo
             visualizer.ApplyState(currentState);
             visualizer.RandomizeAppearance(seed);
             RandomizeScene(seed);
+            episodeTotalReward = 0f;
+            lastInference = null;
 
             bool recordingStarted = false;
             if (record)
@@ -255,10 +301,36 @@ namespace MJWarpDemo
                         scenario = scenario.ScenarioId,
                         image_width = MultiModalCapture.Width,
                         image_height = MultiModalCapture.Height,
+                        unity_version = Application.unityVersion,
+                        application_version = Application.version,
+                        data_source = "synthetic_simulation",
+                        generation_strategy = policy,
+                        license_manifest = "model/third_party/LICENSES.md",
+                        camera_metadata = new
+                        {
+                            front = CameraMetadata(mainCamera, "world"),
+                            wrist = CameraMetadata(wristCamera != null ? wristCamera : mainCamera, "hand"),
+                            distortion_model = "none",
+                            distortion_coefficients = new[] { 0f, 0f, 0f, 0f, 0f },
+                        },
                     },
                     lifetimeCancellation.Token);
                 recordingStarted = true;
                 status = $"正在录制：{started.episode_id}";
+
+                CapturePayload initialImages = await capture.CaptureAsync(currentState.frame_id);
+                await client.SendAsync(
+                    "capture",
+                    new
+                    {
+                        initial = true,
+                        frame_id = initialImages.FrameId,
+                        rgb_b64 = Convert.ToBase64String(initialImages.Rgb),
+                        depth_b64 = Convert.ToBase64String(initialImages.Depth),
+                        instance_b64 = Convert.ToBase64String(initialImages.Instance),
+                        wrist_rgb_b64 = Convert.ToBase64String(initialImages.WristRgb),
+                    },
+                    lifetimeCancellation.Token);
             }
 
             try
@@ -270,6 +342,8 @@ namespace MJWarpDemo
                         new { nworld = 1, scenario = scenario.ScenarioId },
                         lifetimeCancellation.Token);
                     currentState = stepped.state;
+                    lastInference = stepped.inference;
+                    episodeTotalReward += currentState.reward;
                     visualizer.ApplyState(currentState);
                     await Task.Yield();
 
@@ -280,10 +354,12 @@ namespace MJWarpDemo
                             "capture",
                             new
                             {
+                                initial = false,
                                 frame_id = images.FrameId,
                                 rgb_b64 = Convert.ToBase64String(images.Rgb),
                                 depth_b64 = Convert.ToBase64String(images.Depth),
                                 instance_b64 = Convert.ToBase64String(images.Instance),
+                                wrist_rgb_b64 = Convert.ToBase64String(images.WristRgb),
                             },
                             lifetimeCancellation.Token);
                     }
@@ -298,7 +374,53 @@ namespace MJWarpDemo
                     lastDatasetPath = stopped.path;
                 }
             }
-            status = $"回合完成：成功={YesNo(currentState.success)}，帧数={currentState.frame_id}";
+            status = $"回合完成：成功={YesNo(currentState.success)}，帧数={currentState.frame_id}，累计奖励={episodeTotalReward:F3}";
+            return currentState.success;
+        }
+
+        private async void RefreshModels()
+        {
+            await RunOperation(async () =>
+            {
+                ResponseEnvelope response = await client.SendAsync(
+                    "model_list",
+                    new { scenario = scenario.ScenarioId },
+                    lifetimeCancellation.Token);
+                availableModels = response.models ?? Array.Empty<ModelArtifactInfo>();
+                selectedModelIndex = Mathf.Clamp(selectedModelIndex, 0, Math.Max(0, availableModels.Length - 1));
+                status = availableModels.Length == 0 ? "当前场景没有可用的行为克隆模型" : $"发现 {availableModels.Length} 个学习策略模型";
+            });
+        }
+
+        private async void LoadSelectedModel()
+        {
+            if (availableModels.Length == 0)
+                return;
+            await RunOperation(async () =>
+            {
+                ModelArtifactInfo selected = availableModels[selectedModelIndex];
+                status = $"正在加载模型：{selected.artifact_id}";
+                ResponseEnvelope response = await client.SendAsync(
+                    "model_load",
+                    new { scenario = scenario.ScenarioId, artifact_id = selected.artifact_id },
+                    lifetimeCancellation.Token);
+                loadedModel = response.model_info;
+                selectedPolicy = "learned";
+                status = $"学习策略已加载：{response.loaded_model}";
+            });
+        }
+
+        private async void UnloadModel()
+        {
+            await RunOperation(async () =>
+            {
+                await client.SendAsync("model_unload", null, lifetimeCancellation.Token);
+                loadedModel = null;
+                lastInference = null;
+                if (selectedPolicy == "learned")
+                    selectedPolicy = "expert";
+                status = "学习策略已卸载";
+            });
         }
 
         private async void RunBenchmark()
@@ -369,7 +491,61 @@ namespace MJWarpDemo
             mainCamera.transform.LookAt(baseCameraLookAt);
         }
 
+        private void ConfigureWristCamera(ModelSpec spec)
+        {
+            if (wristCamera != null)
+                Destroy(wristCamera.gameObject);
+            wristCamera = null;
+            if (spec?.robot == null || !string.Equals(spec.robot.id, "franka_panda", StringComparison.Ordinal))
+            {
+                capture?.SetWristSource(null);
+                return;
+            }
+            Transform hand = visualizer.FindBodyTransform(spec.robot.end_effector_body);
+            if (hand == null)
+                return;
+            var cameraObject = new GameObject("Panda Wrist Camera");
+            cameraObject.transform.SetParent(hand, false);
+            cameraObject.transform.localPosition = new Vector3(0f, 0.07f, 0f);
+            cameraObject.transform.localRotation = Quaternion.Euler(-90f, 0f, 0f);
+            wristCamera = cameraObject.AddComponent<Camera>();
+            wristCamera.enabled = false;
+            wristCamera.fieldOfView = 62f;
+            wristCamera.nearClipPlane = 0.025f;
+            wristCamera.farClipPlane = 2.0f;
+            capture?.SetWristSource(wristCamera);
+        }
+
+        private static object CameraMetadata(Camera camera, string parentFrame)
+        {
+            float fy = 0.5f * MultiModalCapture.Height / Mathf.Tan(0.5f * camera.fieldOfView * Mathf.Deg2Rad);
+            float fx = fy;
+            Vector3 worldPosition = camera.transform.position;
+            Quaternion worldRotation = camera.transform.rotation;
+            Vector3 parentPosition = parentFrame == "world"
+                ? worldPosition
+                : camera.transform.localPosition;
+            Quaternion parentRotation = parentFrame == "world"
+                ? worldRotation
+                : camera.transform.localRotation;
+            return new
+            {
+                width = MultiModalCapture.Width,
+                height = MultiModalCapture.Height,
+                intrinsics = new[] { fx, 0f, MultiModalCapture.Width * 0.5f, 0f, fy, MultiModalCapture.Height * 0.5f, 0f, 0f, 1f },
+                position_parent_frame = new[] { parentPosition.x, parentPosition.y, parentPosition.z },
+                quaternion_parent_frame_xyzw = new[] { parentRotation.x, parentRotation.y, parentRotation.z, parentRotation.w },
+                position_unity_world = new[] { worldPosition.x, worldPosition.y, worldPosition.z },
+                quaternion_unity_world_xyzw = new[] { worldRotation.x, worldRotation.y, worldRotation.z, worldRotation.w },
+                parent_frame = parentFrame,
+            };
+        }
+
         private int CurrentSeed => int.TryParse(seedText, out int seed) ? seed : 0;
+
+        private int CurrentBatchCount => int.TryParse(batchCountText, out int count)
+            ? Mathf.Clamp(count, 1, 1000)
+            : 20;
 
         private void SetError(Exception exception)
         {
@@ -381,8 +557,9 @@ namespace MJWarpDemo
         {
             if (chineseFont != null)
                 GUI.skin.font = chineseFont;
-            const float panelWidth = 390f;
+            const float panelWidth = 440f;
             GUILayout.BeginArea(new Rect(12f, 12f, panelWidth, Screen.height - 24f), GUI.skin.box);
+            panelScroll = GUILayout.BeginScrollView(panelScroll);
             GUILayout.Label($"MJWarp × Unity｜{scenario?.DisplayName ?? "具身训练数据演示"}", HeaderStyle());
             if (scenario != null)
             {
@@ -400,11 +577,44 @@ namespace MJWarpDemo
             seedText = GUILayout.TextField(seedText, GUILayout.Width(90f));
             GUI.enabled = !busy;
             if (GUILayout.Button("专家策略")) selectedPolicy = "expert";
+            if (GUILayout.Button("扰动策略")) selectedPolicy = "perturbed";
             if (GUILayout.Button("随机策略")) selectedPolicy = "random";
+            GUI.enabled = !busy && loadedModel != null;
+            if (GUILayout.Button("学习策略")) selectedPolicy = "learned";
             GUI.enabled = true;
             GUILayout.EndHorizontal();
             GUILayout.Label($"当前策略：{PolicyDisplayName(selectedPolicy)}");
             recordEpisode = GUILayout.Toggle(recordEpisode, "录制严格对齐的 HDF5 回合数据");
+
+            GUILayout.Space(4f);
+            GUILayout.Label("学习策略模型");
+            if (availableModels.Length == 0)
+            {
+                GUILayout.Label("当前场景尚无行为克隆模型，请先运行训练命令。");
+            }
+            else
+            {
+                ModelArtifactInfo selectedModel = availableModels[selectedModelIndex];
+                GUILayout.Label($"候选 {selectedModelIndex + 1}/{availableModels.Length}：{selectedModel.artifact_id}");
+                GUILayout.Label($"验证 MSE：{selectedModel.validation_mse:F6}");
+                GUILayout.BeginHorizontal();
+                GUI.enabled = !busy && availableModels.Length > 1;
+                if (GUILayout.Button("上一个")) selectedModelIndex = (selectedModelIndex - 1 + availableModels.Length) % availableModels.Length;
+                if (GUILayout.Button("下一个")) selectedModelIndex = (selectedModelIndex + 1) % availableModels.Length;
+                GUI.enabled = !busy && client != null && client.IsConnected;
+                if (GUILayout.Button("加载模型")) LoadSelectedModel();
+                GUILayout.EndHorizontal();
+            }
+            GUILayout.BeginHorizontal();
+            GUI.enabled = !busy && client != null && client.IsConnected;
+            if (GUILayout.Button("刷新模型列表")) RefreshModels();
+            GUI.enabled = !busy && loadedModel != null;
+            if (GUILayout.Button("卸载模型")) UnloadModel();
+            GUI.enabled = true;
+            GUILayout.EndHorizontal();
+            GUILayout.Label(loadedModel == null
+                ? "已加载模型：无"
+                : $"已加载：{loadedModel.artifact_id}｜设备 {loadedModel.device}");
 
             GUILayout.Space(4f);
             GUILayout.Label("切换业务场景");
@@ -426,11 +636,21 @@ namespace MJWarpDemo
             GUILayout.BeginHorizontal();
             GUI.enabled = !busy && client != null && client.IsConnected;
             if (GUILayout.Button("运行单回合")) RunSingleEpisode();
-            if (GUILayout.Button("生成 20 回合")) GenerateAcceptanceSet();
+            GUILayout.Label("批量数", GUILayout.Width(48f));
+            batchCountText = GUILayout.TextField(batchCountText, GUILayout.Width(48f));
+            if (GUILayout.Button("批量采集")) GenerateBatchSet();
             GUI.enabled = busy;
             if (GUILayout.Button("停止")) stopRequested = true;
             GUI.enabled = true;
             GUILayout.EndHorizontal();
+
+            GUILayout.BeginHorizontal();
+            GUI.enabled = !busy && client != null && client.IsConnected;
+            if (GUILayout.Button("生成当前任务 500 回合（专家375 + 扰动125）")) GenerateStandardDataset();
+            GUI.enabled = true;
+            GUILayout.EndHorizontal();
+            if (!string.IsNullOrEmpty(batchSummary))
+                GUILayout.Label(batchSummary);
 
             GUILayout.BeginHorizontal();
             GUI.enabled = !busy;
@@ -445,10 +665,19 @@ namespace MJWarpDemo
                 GUILayout.Space(6f);
                 GUILayout.Label($"帧 {currentState.frame_id}｜仿真时间 {currentState.sim_time:F3} 秒");
                 GUILayout.Label($"奖励 {currentState.reward:F4}｜接触数 {currentState.contacts?.count ?? 0}");
+                GUILayout.Label($"累计奖励 {episodeTotalReward:F4}");
                 GUILayout.Label($"任务阶段 {currentState.task_stage}｜距目标 {currentState.distance_to_goal:F3} 米");
                 GUILayout.Label($"成功 {YesNo(currentState.success)}｜已结束 {YesNo(currentState.terminated)}");
                 if (currentState.metrics != null)
                     GUILayout.Label($"交互物理吞吐：{currentState.metrics.physics_steps_per_second:F0} 步/秒");
+            }
+
+            if (lastInference != null)
+            {
+                string action = lastInference.action == null ? "[]" : $"[{string.Join(", ", lastInference.action.Select(value => value.ToString("F3")))}]";
+                GUILayout.Label($"模型推理：{lastInference.latency_ms:F2} ms｜动作 {action}");
+                if (lastInference.blocked)
+                    GUILayout.Label($"安全归零：{lastInference.error}");
             }
 
             if (!string.IsNullOrEmpty(lastDatasetPath))
@@ -483,6 +712,7 @@ namespace MJWarpDemo
             logScroll = GUILayout.BeginScrollView(logScroll, GUILayout.Height(120f));
             GUILayout.Label(backendLog.ToString());
             GUILayout.EndScrollView();
+            GUILayout.EndScrollView();
             GUILayout.EndArea();
         }
 
@@ -498,7 +728,14 @@ namespace MJWarpDemo
 
         private static string PolicyDisplayName(string policy)
         {
-            return policy == "expert" ? "专家策略" : "随机策略";
+            return policy switch
+            {
+                "expert" => "专家策略",
+                "perturbed" => "受控扰动策略",
+                "random" => "随机策略",
+                "learned" => "学习策略",
+                _ => policy,
+            };
         }
 
         private static string YesNo(bool value)
@@ -511,6 +748,8 @@ namespace MJWarpDemo
             lifetimeCancellation.Cancel();
             if (chineseFont != null)
                 Destroy(chineseFont);
+            if (wristCamera != null)
+                Destroy(wristCamera.gameObject);
             capture?.Dispose();
             visualizer.Dispose();
             client?.Dispose();

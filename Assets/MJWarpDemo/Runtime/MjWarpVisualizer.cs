@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using UnityEngine;
+using UnityEngine.Rendering;
 
 namespace MJWarpDemo
 {
@@ -16,8 +17,10 @@ namespace MJWarpDemo
     public sealed class MjWarpVisualizer : IDisposable
     {
         private readonly Dictionary<int, Transform> bodyTransforms = new Dictionary<int, Transform>();
+        private readonly Dictionary<string, Transform> bodyNameTransforms = new Dictionary<string, Transform>();
         private readonly List<RendererBinding> rendererBindings = new List<RendererBinding>();
         private readonly List<Material> ownedMaterials = new List<Material>();
+        private readonly List<Mesh> ownedMeshes = new List<Mesh>();
         private GameObject root;
         private Transform goalTransform;
 
@@ -32,6 +35,7 @@ namespace MJWarpDemo
                 var bodyObject = new GameObject($"Body {body.id}: {body.name}");
                 bodyObject.transform.SetParent(root.transform, false);
                 bodyTransforms[body.id] = bodyObject.transform;
+                bodyNameTransforms[body.name] = bodyObject.transform;
             }
 
             foreach (GeomSpec geom in spec.geoms)
@@ -50,6 +54,8 @@ namespace MJWarpDemo
                     UnityEngine.Object.Destroy(collider);
 
                 Renderer renderer = visual.GetComponent<Renderer>();
+                if (renderer == null)
+                    continue;
                 Material rgbMaterial = CreateRgbMaterial(geom.rgba);
                 Material instanceMaterial = CreateInstanceMaterial(geom.id + 1);
                 renderer.sharedMaterial = rgbMaterial;
@@ -106,9 +112,45 @@ namespace MJWarpDemo
                     capsule.transform.localScale = new Vector3(radius * 2f, halfLength + radius, radius * 2f);
                     return capsule;
                 }
+                case "mesh":
+                {
+                    if (geom.vertices == null || geom.triangles == null || geom.vertices.Length == 0)
+                        return null;
+                    var visual = new GameObject("MJWarp Mesh");
+                    var filter = visual.AddComponent<MeshFilter>();
+                    visual.AddComponent<MeshRenderer>();
+                    var mesh = new Mesh { name = $"MJWarp Mesh {geom.id}" };
+                    if (geom.vertices.Length > 65535)
+                        mesh.indexFormat = IndexFormat.UInt32;
+                    var vertices = new Vector3[geom.vertices.Length];
+                    for (int index = 0; index < vertices.Length; index++)
+                        vertices[index] = MjWarpCoordinates.Position(geom.vertices[index]);
+                    var triangles = (int[])geom.triangles.Clone();
+                    // MuJoCo -> Unity includes a handedness reflection, so flip triangle winding.
+                    for (int index = 0; index + 2 < triangles.Length; index += 3)
+                    {
+                        int swap = triangles[index + 1];
+                        triangles[index + 1] = triangles[index + 2];
+                        triangles[index + 2] = swap;
+                    }
+                    mesh.vertices = vertices;
+                    mesh.triangles = triangles;
+                    mesh.RecalculateNormals();
+                    mesh.RecalculateBounds();
+                    filter.sharedMesh = mesh;
+                    ownedMeshes.Add(mesh);
+                    return visual;
+                }
                 default:
                     return null;
             }
+        }
+
+        public Transform FindBodyTransform(string bodyName)
+        {
+            return bodyName != null && bodyNameTransforms.TryGetValue(bodyName, out Transform body)
+                ? body
+                : null;
         }
 
         private Material CreateRgbMaterial(float[] rgba)
@@ -203,6 +245,7 @@ namespace MJWarpDemo
         public void Dispose()
         {
             bodyTransforms.Clear();
+            bodyNameTransforms.Clear();
             rendererBindings.Clear();
             foreach (Material material in ownedMaterials)
             {
@@ -210,6 +253,12 @@ namespace MJWarpDemo
                     UnityEngine.Object.Destroy(material);
             }
             ownedMaterials.Clear();
+            foreach (Mesh mesh in ownedMeshes)
+            {
+                if (mesh != null)
+                    UnityEngine.Object.Destroy(mesh);
+            }
+            ownedMeshes.Clear();
             if (root != null)
                 UnityEngine.Object.Destroy(root);
             root = null;

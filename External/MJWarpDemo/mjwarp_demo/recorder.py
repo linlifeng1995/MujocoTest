@@ -155,3 +155,14 @@ class EpisodeRecorder:
         self.file.flush()
         self.file.close()
         self.closed = True
+
+
+# Schema 2.0 is implemented separately to keep the legacy reader history intact while
+# making all public imports resolve to the explicit N-transition / N+1-observation recorder.
+from .recorder_v2 import (  # noqa: E402,F401
+    EpisodeRecorder as EpisodeRecorder,
+    IMAGE_HEIGHT as IMAGE_HEIGHT,
+    IMAGE_WIDTH as IMAGE_WIDTH,
+    MAX_CONTACTS as MAX_CONTACTS,
+    SCHEMA_VERSION as SCHEMA_VERSION,
+)

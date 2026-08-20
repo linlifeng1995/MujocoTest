@@ -3,17 +3,17 @@ from pathlib import Path
 import mujoco
 import pytest
 
-from mjwarp_demo.scenarios import SCENARIOS, get_scenario, scenario_summaries
+from mjwarp_demo.scenarios import SCENARIOS, get_robot, get_scenario, scenario_summaries
 
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 
 
 @pytest.mark.parametrize("scenario_id", sorted(SCENARIOS))
-def test_scenario_models_compile_and_expose_two_actions(scenario_id: str) -> None:
+def test_scenario_models_compile_and_match_robot_action_contract(scenario_id: str) -> None:
     definition = get_scenario(scenario_id)
     model = mujoco.MjModel.from_xml_path(str(definition.model_path(PACKAGE_ROOT)))
-    assert model.nu == 2
+    assert model.nu == get_robot(definition.robot_id).action_dim
     assert model.opt.timestep == pytest.approx(0.005)
     assert model.ngeom > 0
 

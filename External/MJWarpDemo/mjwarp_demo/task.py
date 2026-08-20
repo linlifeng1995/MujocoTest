@@ -12,14 +12,14 @@ import numpy as np
 import warp as wp
 
 from .recorder import MAX_CONTACTS
-from .scenarios import DEFAULT_SCENARIO_ID, ScenarioDefinition, get_scenario
+from .scenarios import DEFAULT_SCENARIO_ID, RobotDefinition, ScenarioDefinition, get_robot, get_scenario
 
 PHYSICS_DT = 0.005
 ACTION_REPEAT = 10
 CONTROL_DT = PHYSICS_DT * ACTION_REPEAT
-MAX_FRAMES = 120
 ARM_BASE_XY = np.array([-0.35, 0.0], dtype=np.float32)
 ARM_LINK_LENGTHS = (0.32, 0.28)
+PANDA_STAGE_DURATIONS = (50, 70, 35, 60, 90, 65, 35, 45)
 
 
 def _name(model: mujoco.MjModel, object_type: mujoco.mjtObj, object_id: int, fallback: str) -> str:
@@ -44,6 +44,7 @@ class EmbodiedTask:
         if device.startswith("cuda") and not wp.is_cuda_available():
             raise RuntimeError("MJWarp demo requires a CUDA-capable GPU; no CUDA device was found")
         self.definition = definition
+        self.robot: RobotDefinition = get_robot(definition.robot_id)
         self.task_name = definition.scenario_id
         self.device = wp.get_device(device)
         self.model_path = Path(model_path)
@@ -51,24 +52,41 @@ class EmbodiedTask:
         self.mj_model = mujoco.MjModel.from_xml_path(str(self.model_path))
         if not math.isclose(float(self.mj_model.opt.timestep), PHYSICS_DT, abs_tol=1e-9):
             raise ValueError(f"MJCF timestep must be {PHYSICS_DT}")
-        if self.mj_model.nu != 2:
-            raise ValueError(f"scenario {self.task_name} must expose exactly two actuators")
 
-        with wp.ScopedDevice(self.device):
-            self.model = mjw.put_model(self.mj_model)
-            self.data = mjw.make_data(self.mj_model, nworld=self.nworld)
+        self.actuator_ids = np.asarray(
+            [
+                mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_ACTUATOR, name)
+                for name in self.robot.actuator_names
+            ],
+            dtype=np.int32,
+        )
+        if np.any(self.actuator_ids < 0):
+            raise ValueError(f"scenario {self.task_name} is missing actuators {self.robot.actuator_names}")
+        if self.mj_model.nu != self.robot.action_dim:
+            raise ValueError(
+                f"scenario {self.task_name} exposes {self.mj_model.nu} actuators, "
+                f"robot contract expects {self.robot.action_dim}"
+            )
 
         joint_ids = [
             mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_JOINT, name)
-            for name in definition.controlled_joints
+            for name in self.robot.controlled_joints
         ]
         if any(joint_id < 0 for joint_id in joint_ids):
-            raise ValueError(f"scenario {self.task_name} is missing controlled joints {definition.controlled_joints}")
+            raise ValueError(
+                f"scenario {self.task_name} is missing controlled joints {self.robot.controlled_joints}"
+            )
+        self.controlled_joint_ids = np.asarray(joint_ids, dtype=np.int32)
         self.controlled_qpos_adr = np.asarray([self.mj_model.jnt_qposadr[joint_id] for joint_id in joint_ids], dtype=np.int32)
         self.controlled_dof_adr = np.asarray([self.mj_model.jnt_dofadr[joint_id] for joint_id in joint_ids], dtype=np.int32)
         self.agent_body_id = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, definition.agent_body)
         if self.agent_body_id < 0:
             raise ValueError(f"scenario {self.task_name} is missing agent body {definition.agent_body}")
+        self.end_effector_site_id = -1
+        if self.robot.end_effector_site:
+            self.end_effector_site_id = mujoco.mj_name2id(
+                self.mj_model, mujoco.mjtObj.mjOBJ_SITE, self.robot.end_effector_site
+            )
 
         self.object_qpos_adr: int | None = None
         self.object_body_id: int | None = None
@@ -76,11 +94,36 @@ class EmbodiedTask:
             object_joint_id = mujoco.mj_name2id(
                 self.mj_model, mujoco.mjtObj.mjOBJ_JOINT, definition.object_joint
             )
+            if object_joint_id < 0:
+                raise ValueError(f"scenario {self.task_name} is missing object joint {definition.object_joint}")
             self.object_qpos_adr = int(self.mj_model.jnt_qposadr[object_joint_id])
         if definition.object_body is not None:
             self.object_body_id = mujoco.mj_name2id(
                 self.mj_model, mujoco.mjtObj.mjOBJ_BODY, definition.object_body
             )
+            if self.object_body_id < 0:
+                raise ValueError(f"scenario {self.task_name} is missing object body {definition.object_body}")
+        self.object_geom_ids = (
+            np.flatnonzero(np.asarray(self.mj_model.geom_bodyid) == self.object_body_id).astype(np.int32)
+            if self.object_body_id is not None
+            else np.asarray([], dtype=np.int32)
+        )
+        self.grasp_weld_id = mujoco.mj_name2id(
+            self.mj_model, mujoco.mjtObj.mjOBJ_EQUALITY, "expert_grasp_weld"
+        )
+
+        self.action_dim = self.robot.action_dim
+        actuator_ranges = np.asarray(self.mj_model.actuator_ctrlrange[self.actuator_ids], dtype=np.float32)
+        self.action_command_low = actuator_ranges[:, 0].copy()
+        self.action_command_high = actuator_ranges[:, 1].copy()
+        if self.robot.robot_id == "franka_panda":
+            self.action_command_high[-1] *= 2.0
+        self.base_body_mass = np.asarray(self.mj_model.body_mass, dtype=np.float32).copy()
+        self.base_geom_friction = np.asarray(self.mj_model.geom_friction, dtype=np.float32).copy()
+
+        with wp.ScopedDevice(self.device):
+            self.model = mjw.put_model(self.mj_model)
+            self.data = mjw.make_data(self.mj_model, nworld=self.nworld)
 
         self.rng = np.random.default_rng(0)
         self.policy = "expert"
@@ -90,27 +133,45 @@ class EmbodiedTask:
         self.success_streak = np.zeros(self.nworld, dtype=np.int32)
         self.success = np.zeros(self.nworld, dtype=np.bool_)
         self.terminated = np.zeros(self.nworld, dtype=np.bool_)
-        self.random_action = np.zeros((self.nworld, 2), dtype=np.float32)
-        self.last_action = np.zeros((self.nworld, 2), dtype=np.float32)
+        self.termination_reason = np.full(self.nworld, "", dtype=object)
+        self.random_action = np.zeros((self.nworld, self.action_dim), dtype=np.float32)
+        self.last_action = np.zeros((self.nworld, self.action_dim), dtype=np.float32)
+        self.last_action_command = np.zeros((self.nworld, self.action_dim), dtype=np.float32)
         self.last_reward = np.zeros(self.nworld, dtype=np.float32)
         self.frame_id = 0
         self.seed = 0
+        self.randomization: dict[str, Any] = {}
+        self._panda_waypoints: np.ndarray | None = None
+        self._panda_gripper_targets: np.ndarray | None = None
+        self._panda_joint_trajectory: np.ndarray | None = None
+        self._panda_gripper_trajectory: np.ndarray | None = None
+        self._ik_data = mujoco.MjData(self.mj_model) if self.end_effector_site_id >= 0 else None
+        self._ik_target_quaternion: np.ndarray | None = None
+        self._ik_target_matrix: np.ndarray | None = None
+        self._grasp_weld_active = False
         self.reset(seed=0, policy="expert")
 
     @property
     def gpu_name(self) -> str:
         return self.device.name
 
+    @property
+    def is_panda(self) -> bool:
+        return self.robot.robot_id == "franka_panda"
+
     def reset(self, seed: int, policy: str = "expert") -> dict[str, Any]:
-        if policy not in {"expert", "random"}:
+        if policy not in {"expert", "perturbed", "random", "learned"}:
             raise ValueError(f"unsupported policy: {policy}")
         self.seed = int(seed)
         self.rng = np.random.default_rng(self.seed)
         self.policy = policy
+        self.randomization = {}
 
         qpos = np.tile(np.asarray(self.mj_model.qpos0, dtype=np.float32), (self.nworld, 1))
         qvel = np.zeros((self.nworld, self.mj_model.nv), dtype=np.float32)
-        if self.definition.mode == "push":
+        if self.is_panda:
+            self._reset_panda(qpos)
+        elif self.definition.mode == "push":
             self._reset_push(qpos)
         elif self.definition.mode == "insert":
             self._reset_insert(qpos)
@@ -121,25 +182,288 @@ class EmbodiedTask:
         else:
             raise ValueError(f"unsupported scenario mode: {self.definition.mode}")
 
+        self._apply_physics_randomization()
+        initial_controls = self._initial_controls(qpos)
         with wp.ScopedDevice(self.device):
             self.data.qpos.assign(qpos)
             self.data.qvel.assign(qvel)
-            self.data.ctrl.assign(np.zeros((self.nworld, self.mj_model.nu), dtype=np.float32))
+            self.data.ctrl.assign(initial_controls)
             self.data.time.assign(np.zeros(self.nworld, dtype=np.float32))
             mjw.forward(self.model, self.data)
             wp.synchronize_device(self.device)
+        self._set_expert_grasp_constraint(False)
 
         self.stage.fill(0)
         self.success_streak.fill(0)
         self.success.fill(False)
         self.terminated.fill(False)
+        self.termination_reason[:] = ""
         self.random_action.fill(0.0)
-        self.last_action.fill(0.0)
         self.last_reward.fill(0.0)
         self.frame_id = 0
+        if self.is_panda:
+            self.last_action_command = self._logical_command_from_controls(initial_controls)
+            self.last_action = self._normalize_position_command(self.last_action_command)
+        else:
+            self.last_action.fill(0.0)
+            self.last_action_command.fill(0.0)
         position = self._evaluation_positions()
-        self.previous_distance = np.linalg.norm(position[:, :2] - self.goal[:, :2], axis=1).astype(np.float32)
+        self.previous_distance = self._task_distance(position)
         return self.state_dict()
+
+    def _reset_panda(self, qpos: np.ndarray) -> None:
+        home = np.asarray(self.robot.home_qpos, dtype=np.float32)
+        if home.shape != (len(self.controlled_qpos_adr),):
+            raise ValueError("Panda home_qpos does not match controlled joint count")
+        qpos[:, self.controlled_qpos_adr] = home
+        if self.object_qpos_adr is None:
+            raise ValueError(f"scenario {self.task_name} requires a free object joint")
+
+        if self.definition.mode == "panda_pick_place":
+            object_xy = np.column_stack(
+                (self.rng.uniform(0.42, 0.49, self.nworld), self.rng.uniform(-0.18, -0.07, self.nworld))
+            ).astype(np.float32)
+            goal_xy = np.column_stack(
+                (self.rng.uniform(0.58, 0.66, self.nworld), self.rng.uniform(0.11, 0.20, self.nworld))
+            ).astype(np.float32)
+            object_z = 0.075
+            goal_z = 0.082
+        else:
+            object_xy = np.column_stack(
+                (self.rng.uniform(0.40, 0.46, self.nworld), self.rng.uniform(-0.18, -0.10, self.nworld))
+            ).astype(np.float32)
+            goal_xy = np.column_stack(
+                (self.rng.uniform(0.57, 0.63, self.nworld), self.rng.uniform(0.10, 0.17, self.nworld))
+            ).astype(np.float32)
+            object_z = 0.105
+            goal_z = 0.105
+
+        qpos[:, self.object_qpos_adr : self.object_qpos_adr + 3] = np.column_stack(
+            (object_xy, np.full(self.nworld, object_z, dtype=np.float32))
+        )
+        qpos[:, self.object_qpos_adr + 3 : self.object_qpos_adr + 7] = np.asarray(
+            [1.0, 0.0, 0.0, 0.0], dtype=np.float32
+        )
+        self.goal[:, :2] = goal_xy
+        self.goal[:, 2] = goal_z
+        self.randomization = {
+            "randomization_group": f"panda-{self.seed % 20:02d}",
+            "object_position": [float(object_xy[0, 0]), float(object_xy[0, 1]), object_z],
+            "goal_position": self.goal[0].astype(float).tolist(),
+            "object_mass_scale": float(self.rng.uniform(0.85, 1.15)),
+            "object_friction_scale": float(self.rng.uniform(0.80, 1.20)),
+            "motion_noise_std": 0.035 if self.policy == "perturbed" else 0.0,
+        }
+        self._prepare_panda_waypoints(qpos)
+
+    def _prepare_panda_waypoints(self, qpos: np.ndarray) -> None:
+        if self._ik_data is None or self.end_effector_site_id < 0:
+            raise RuntimeError("Panda scenario requires a valid end-effector site")
+        stages = len(PANDA_STAGE_DURATIONS)
+        total_frames = sum(PANDA_STAGE_DURATIONS)
+        waypoints = np.zeros((self.nworld, stages, 7), dtype=np.float32)
+        grippers = np.zeros((self.nworld, stages), dtype=np.float32)
+        joint_trajectory = np.zeros((self.nworld, total_frames, 7), dtype=np.float32)
+        gripper_trajectory = np.zeros((self.nworld, total_frames), dtype=np.float32)
+        for world in range(self.nworld):
+            object_position = np.asarray(
+                qpos[world, self.object_qpos_adr : self.object_qpos_adr + 3], dtype=np.float64
+            )
+            goal = np.asarray(self.goal[world], dtype=np.float64)
+            if self.definition.mode == "panda_pick_place":
+                targets = (
+                    object_position + np.asarray([0.0, 0.0, 0.18]),
+                    object_position + np.asarray([0.0, 0.0, 0.003]),
+                    object_position + np.asarray([0.0, 0.0, 0.003]),
+                    object_position + np.asarray([0.0, 0.0, 0.24]),
+                    goal + np.asarray([0.0, 0.0, 0.20]),
+                    goal + np.asarray([0.0, 0.0, 0.010]),
+                    goal + np.asarray([0.0, 0.0, 0.010]),
+                    goal + np.asarray([0.0, 0.0, 0.24]),
+                )
+            else:
+                transit_midpoint = 0.5 * (object_position + goal)
+                targets = (
+                    object_position + np.asarray([0.0, 0.0, 0.20]),
+                    object_position + np.asarray([0.0, 0.0, 0.020]),
+                    object_position + np.asarray([0.0, 0.0, 0.020]),
+                    object_position + np.asarray([0.0, 0.0, 0.25]),
+                    transit_midpoint + np.asarray([0.0, 0.0, 0.25]),
+                    goal + np.asarray([0.0, 0.0, 0.22]),
+                    goal + np.asarray([0.0, 0.0, 0.028]),
+                    goal + np.asarray([0.0, 0.0, 0.20]),
+                )
+            if self.definition.mode == "panda_peg_insert":
+                grippers[world] = np.asarray([0.08, 0.08, 0.018, 0.018, 0.018, 0.018, 0.018, 0.08])
+            else:
+                grippers[world] = np.asarray([0.08, 0.08, 0.0, 0.0, 0.0, 0.0, 0.08, 0.08])
+            current = np.asarray(qpos[world], dtype=np.float64).copy()
+            self._ik_data.qpos[:] = current
+            mujoco.mj_forward(self.mj_model, self._ik_data)
+            segment_start_position = np.asarray(
+                self._ik_data.site_xpos[self.end_effector_site_id], dtype=np.float64
+            ).copy()
+            segment_start_gripper = float(np.sum(current[self.controlled_qpos_adr[7:9]]))
+            frame_cursor = 0
+            for stage_index, (target, duration) in enumerate(zip(targets, PANDA_STAGE_DURATIONS)):
+                # The Panda position actuators settle slightly below the kinematic target under
+                # gravity in MJWarp. Calibrate the expert waypoint, while keeping recorded state
+                # and commanded state separate in Schema 2.0.
+                compensated_target = target + np.asarray([0.018, -0.004, 0.024])
+                subsegments = max(1, math.ceil(duration / 5))
+                boundaries = np.linspace(0, duration, subsegments + 1, dtype=np.int32)
+                previous_q = current[self.controlled_qpos_adr[:7]].copy()
+                for subsegment in range(1, subsegments + 1):
+                    alpha = subsegment / subsegments
+                    intermediate_target = (
+                        (1.0 - alpha) * segment_start_position + alpha * compensated_target
+                    )
+                    current = self._solve_site_ik(current, intermediate_target)
+                    next_q = current[self.controlled_qpos_adr[:7]].copy()
+                    local_start = int(boundaries[subsegment - 1])
+                    local_end = int(boundaries[subsegment])
+                    count = local_end - local_start
+                    for local_index in range(count):
+                        blend = (local_index + 1) / count
+                        joint_trajectory[world, frame_cursor + local_start + local_index] = (
+                            (1.0 - blend) * previous_q + blend * next_q
+                        )
+                    previous_q = next_q
+                waypoints[world, stage_index] = current[self.controlled_qpos_adr[:7]]
+                target_gripper = float(grippers[world, stage_index])
+                gripper_trajectory[world, frame_cursor : frame_cursor + duration] = np.linspace(
+                    segment_start_gripper, target_gripper, duration, dtype=np.float32
+                )
+                frame_cursor += duration
+                segment_start_position = compensated_target
+                segment_start_gripper = target_gripper
+        self._panda_waypoints = waypoints
+        self._panda_gripper_targets = grippers
+        self._panda_joint_trajectory = joint_trajectory
+        self._panda_gripper_trajectory = gripper_trajectory
+
+    def _solve_site_ik(self, initial_qpos: np.ndarray, target_position: np.ndarray) -> np.ndarray:
+        assert self._ik_data is not None
+        data = self._ik_data
+        qpos = np.asarray(initial_qpos, dtype=np.float64).copy()
+        if self._ik_target_matrix is None:
+            data.qpos[:] = qpos
+            mujoco.mj_forward(self.mj_model, data)
+            self._ik_target_matrix = np.asarray(
+                data.site_xmat[self.end_effector_site_id], dtype=np.float64
+            ).reshape(3, 3).copy()
+        target_matrix = self._ik_target_matrix
+        arm_dofs = self.controlled_dof_adr[:7]
+        for _ in range(400):
+            data.qpos[:] = qpos
+            mujoco.mj_forward(self.mj_model, data)
+            position_error = np.asarray(target_position) - data.site_xpos[self.end_effector_site_id]
+            current_matrix = np.asarray(
+                data.site_xmat[self.end_effector_site_id], dtype=np.float64
+            ).reshape(3, 3)
+            rotation_error = 0.5 * sum(
+                np.cross(current_matrix[:, axis], target_matrix[:, axis]) for axis in range(3)
+            )
+            if np.linalg.norm(position_error) < 0.0015 and np.linalg.norm(rotation_error) < 0.025:
+                break
+            jacp = np.zeros((3, self.mj_model.nv), dtype=np.float64)
+            jacr = np.zeros((3, self.mj_model.nv), dtype=np.float64)
+            mujoco.mj_jacSite(self.mj_model, data, jacp, jacr, self.end_effector_site_id)
+            orientation_weight = 0.25
+            jacobian = np.vstack((jacp[:, arm_dofs], orientation_weight * jacr[:, arm_dofs]))
+            error = np.concatenate((position_error, orientation_weight * rotation_error))
+            delta_arm = jacobian.T @ np.linalg.solve(
+                jacobian @ jacobian.T + 7.5e-4 * np.eye(6), error
+            )
+            delta_arm = np.clip(delta_arm, -0.12, 0.12)
+            velocity = np.zeros(self.mj_model.nv, dtype=np.float64)
+            velocity[arm_dofs] = delta_arm
+            mujoco.mj_integratePos(self.mj_model, qpos, velocity, 0.7)
+            for joint_id, qpos_adr in zip(self.controlled_joint_ids[:7], self.controlled_qpos_adr[:7]):
+                if self.mj_model.jnt_limited[joint_id]:
+                    qpos[qpos_adr] = np.clip(qpos[qpos_adr], *self.mj_model.jnt_range[joint_id])
+        return qpos
+
+    def _apply_physics_randomization(self) -> None:
+        body_mass = self.base_body_mass.copy()
+        geom_friction = self.base_geom_friction.copy()
+        if self.object_body_id is not None and self.randomization:
+            body_mass[self.object_body_id] *= float(self.randomization.get("object_mass_scale", 1.0))
+            geom_friction[self.object_geom_ids] *= float(
+                self.randomization.get("object_friction_scale", 1.0)
+            )
+        if hasattr(self.model, "body_mass"):
+            self.model.body_mass.assign(body_mass)
+        if hasattr(self.model, "geom_friction"):
+            self.model.geom_friction.assign(geom_friction)
+
+    def _set_expert_grasp_constraint(self, active: bool) -> None:
+        if self.grasp_weld_id < 0 or self._grasp_weld_active == active:
+            return
+        with wp.ScopedDevice(self.device):
+            if active:
+                eq_data = self.model.eq_data.numpy().copy()
+                body_position = self.data.xpos.numpy()[0]
+                body_quaternion = self.data.xquat.numpy()[0]
+                body_matrix = self.data.xmat.numpy()[0]
+                body1 = self.agent_body_id
+                assert self.object_body_id is not None
+                body2 = self.object_body_id
+                anchor1 = np.asarray(body_matrix[body1], dtype=np.float64).reshape(3, 3).T @ (
+                    body_position[body2] - body_position[body1]
+                )
+                q1_inverse = np.asarray(body_quaternion[body1], dtype=np.float64).copy()
+                q1_inverse[1:] *= -1.0
+                relative_quaternion = np.zeros(4, dtype=np.float64)
+                mujoco.mju_mulQuat(
+                    relative_quaternion,
+                    q1_inverse,
+                    np.asarray(body_quaternion[body2], dtype=np.float64),
+                )
+                eq_data[:, self.grasp_weld_id, 0:3] = 0.0
+                eq_data[:, self.grasp_weld_id, 3:6] = anchor1
+                eq_data[:, self.grasp_weld_id, 6:10] = relative_quaternion
+                self.model.eq_data.assign(eq_data)
+            eq_active = self.data.eq_active.numpy().copy()
+            eq_active[:, self.grasp_weld_id] = active
+            self.data.eq_active.assign(eq_active)
+            wp.synchronize_device(self.device)
+        self._grasp_weld_active = active
+
+    def _initial_controls(self, qpos: np.ndarray) -> np.ndarray:
+        controls = np.zeros((self.nworld, self.mj_model.nu), dtype=np.float32)
+        if self.is_panda:
+            command = np.column_stack(
+                (qpos[:, self.controlled_qpos_adr[:7]], np.full(self.nworld, 0.08, dtype=np.float32))
+            )
+            controls[:, self.actuator_ids] = self._controls_from_logical_command(command)
+        return controls
+
+    def _logical_command_from_controls(self, controls: np.ndarray) -> np.ndarray:
+        command = np.asarray(controls[:, self.actuator_ids], dtype=np.float32).copy()
+        if self.is_panda:
+            command[:, -1] *= 2.0
+        return command
+
+    def _controls_from_logical_command(self, command: np.ndarray) -> np.ndarray:
+        controls = np.asarray(command, dtype=np.float32).copy()
+        if self.is_panda:
+            controls[:, -1] *= 0.5
+        return controls
+
+    def _normalize_position_command(self, command: np.ndarray) -> np.ndarray:
+        span = np.maximum(self.action_command_high - self.action_command_low, 1e-6)
+        return np.clip(
+            2.0 * (command - self.action_command_low[None, :]) / span[None, :] - 1.0,
+            -1.0,
+            1.0,
+        ).astype(np.float32)
+
+    def _denormalize_position_action(self, action: np.ndarray) -> np.ndarray:
+        span = self.action_command_high - self.action_command_low
+        return (
+            self.action_command_low[None, :] + 0.5 * (action + 1.0) * span[None, :]
+        ).astype(np.float32)
 
     def _reset_push(self, qpos: np.ndarray) -> None:
         object_xy = np.column_stack(
@@ -196,6 +520,11 @@ class EmbodiedTask:
         initial_joint = self._ik(behind)
         initial_joint += self.rng.normal(0.0, 0.015, initial_joint.shape).astype(np.float32)
         qpos[:, self.controlled_qpos_adr] = initial_joint
+        self.randomization = {
+            "randomization_group": f"legacy-{self.seed % 20:02d}",
+            "object_position": [float(value) for value in qpos[0, self.object_qpos_adr : self.object_qpos_adr + 3]],
+            "goal_position": self.goal[0].astype(float).tolist(),
+        }
 
     def _reset_reach(self, qpos: np.ndarray) -> None:
         stations = np.asarray(
@@ -208,6 +537,10 @@ class EmbodiedTask:
         initial_joint = self._ik(home)
         initial_joint += self.rng.normal(0.0, 0.04, initial_joint.shape).astype(np.float32)
         qpos[:, self.controlled_qpos_adr] = initial_joint
+        self.randomization = {
+            "randomization_group": f"legacy-{self.seed % 20:02d}",
+            "goal_position": self.goal[0].astype(float).tolist(),
+        }
 
     def _reset_navigation(self, qpos: np.ndarray) -> None:
         start_xy = np.column_stack(
@@ -225,6 +558,11 @@ class EmbodiedTask:
         qpos[:, self.controlled_qpos_adr] = start_xy
         self.goal[:, :2] = goal_xy
         self.goal[:, 2] = 0.005
+        self.randomization = {
+            "randomization_group": f"legacy-{self.seed % 20:02d}",
+            "start_position": start_xy[0].astype(float).tolist(),
+            "goal_position": self.goal[0].astype(float).tolist(),
+        }
 
     def _ik(self, target_xy: np.ndarray) -> np.ndarray:
         l1, l2 = ARM_LINK_LENGTHS
@@ -238,8 +576,12 @@ class EmbodiedTask:
         return np.column_stack((_wrap_angle(q1), _wrap_angle(q2))).astype(np.float32)
 
     def _policy_action(self) -> np.ndarray:
+        if self.policy == "learned":
+            raise RuntimeError("learned policy steps require an explicit action from the model runtime")
+        if self.is_panda:
+            return self._panda_policy_action()
         if self.policy == "random":
-            noise = self.rng.uniform(-1.0, 1.0, (self.nworld, 2)).astype(np.float32)
+            noise = self.rng.uniform(-1.0, 1.0, (self.nworld, self.action_dim)).astype(np.float32)
             self.random_action = np.clip(0.86 * self.random_action + 0.24 * noise, -1.0, 1.0)
             return self.random_action.copy()
         if self.definition.mode in {"push", "insert"}:
@@ -250,6 +592,52 @@ class EmbodiedTask:
         if self.definition.mode == "navigate":
             return self._navigation_policy_action()
         raise ValueError(f"unsupported scenario mode: {self.definition.mode}")
+
+    def _panda_stage_index(self) -> int:
+        cumulative = 0
+        for index, duration in enumerate(PANDA_STAGE_DURATIONS):
+            cumulative += duration
+            if self.frame_id < cumulative:
+                return index
+        return len(PANDA_STAGE_DURATIONS) - 1
+
+    def _panda_policy_action(self) -> np.ndarray:
+        current_joint = self.data.qpos.numpy()[:, self.controlled_qpos_adr]
+        if self.policy == "random":
+            noise = self.rng.normal(0.0, 0.7, (self.nworld, self.action_dim)).astype(np.float32)
+            self.random_action = np.clip(0.88 * self.random_action + 0.12 * noise, -1.0, 1.0)
+            centered = np.column_stack(
+                (current_joint[:, :7], np.sum(current_joint[:, 7:9], axis=1))
+            )
+            command = centered + self.random_action * np.asarray(
+                [0.10, 0.10, 0.10, 0.08, 0.10, 0.10, 0.10, 0.015], dtype=np.float32
+            )
+            command = np.clip(command, self.action_command_low, self.action_command_high)
+            return self._normalize_position_command(command)
+
+        assert self._panda_joint_trajectory is not None and self._panda_gripper_trajectory is not None
+        stage = self._panda_stage_index()
+        self.stage[:] = stage
+        if self.definition.mode == "panda_peg_insert":
+            self._set_expert_grasp_constraint(3 <= stage <= 6)
+        trajectory_index = min(self.frame_id, self._panda_joint_trajectory.shape[1] - 1)
+        target = np.column_stack(
+            (
+                self._panda_joint_trajectory[:, trajectory_index, :],
+                self._panda_gripper_trajectory[:, trajectory_index],
+            )
+        )
+        current = np.column_stack(
+            (current_joint[:, :7], np.sum(current_joint[:, 7:9], axis=1))
+        )
+        max_delta = np.asarray([0.050] * 7 + [0.006], dtype=np.float32)
+        command = current + np.clip(target - current, -max_delta, max_delta)
+        if self.policy == "perturbed":
+            command[:, :7] += self.rng.normal(0.0, 0.012, (self.nworld, 7)).astype(np.float32)
+            if self.seed % 4 == 0 and stage == 5:
+                command[:, -1] = 0.08
+        command = np.clip(command, self.action_command_low, self.action_command_high)
+        return self._normalize_position_command(command)
 
     def _push_policy_action(self) -> np.ndarray:
         object_position = self._object_positions()[:, :2]
@@ -301,22 +689,29 @@ class EmbodiedTask:
             action_array = self._policy_action()
         else:
             action_array = np.asarray(action, dtype=np.float32)
-            if action_array.shape == (2,):
+            if action_array.shape == (self.action_dim,):
                 action_array = np.tile(action_array, (self.nworld, 1))
-            if action_array.shape != (self.nworld, 2):
-                raise ValueError(f"action must have shape (2,) or ({self.nworld}, 2), got {action_array.shape}")
+            if action_array.shape != (self.nworld, self.action_dim):
+                raise ValueError(
+                    f"action must have shape ({self.action_dim},) or "
+                    f"({self.nworld}, {self.action_dim}), got {action_array.shape}"
+                )
             action_array = np.clip(action_array, -1.0, 1.0)
         action_array[self.terminated] = 0.0
 
-        qvel = self.data.qvel.numpy()[:, self.controlled_dof_adr]
-        desired_velocity = action_array * self.definition.max_speed
-        torque = np.clip(
-            4.0 * (desired_velocity - qvel),
-            -self.definition.torque_limit,
-            self.definition.torque_limit,
-        ).astype(np.float32)
         controls = np.zeros((self.nworld, self.mj_model.nu), dtype=np.float32)
-        controls[:, :2] = torque
+        if self.robot.control_mode == "joint_position_target":
+            command = self._denormalize_position_action(action_array)
+            controls[:, self.actuator_ids] = self._controls_from_logical_command(command)
+        else:
+            qvel = self.data.qvel.numpy()[:, self.controlled_dof_adr]
+            desired_velocity = action_array * self.definition.max_speed
+            command = np.clip(
+                4.0 * (desired_velocity - qvel),
+                -self.definition.torque_limit,
+                self.definition.torque_limit,
+            ).astype(np.float32)
+            controls[:, self.actuator_ids] = command
 
         with wp.ScopedDevice(self.device):
             self.data.ctrl.assign(controls)
@@ -326,22 +721,35 @@ class EmbodiedTask:
 
         self.frame_id += 1
         self.last_action = action_array
+        self.last_action_command = command
         position = self._evaluation_positions()
-        distance = np.linalg.norm(position[:, :2] - self.goal[:, :2], axis=1).astype(np.float32)
+        distance = self._task_distance(position)
         progress = self.previous_distance - distance
-        reached = distance < self.definition.goal_radius
+        reached = self._success_condition(position, distance)
         self.success_streak = np.where(reached, self.success_streak + 1, 0)
         self.success |= self.success_streak >= self.definition.success_frames
         out_of_bounds = (
-            (np.abs(position[:, 0]) > 0.80)
-            | (np.abs(position[:, 1]) > 0.62)
+            (np.abs(position[:, 0]) > 1.10)
+            | (np.abs(position[:, 1]) > 0.85)
             | (position[:, 2] < -0.02)
         )
-        timed_out = self.frame_id >= MAX_FRAMES
+        timed_out = self.frame_id >= self.definition.max_frames
         self.terminated |= self.success | out_of_bounds | timed_out
+        for index in range(self.nworld):
+            if self.success[index]:
+                self.termination_reason[index] = "success"
+            elif out_of_bounds[index]:
+                self.termination_reason[index] = "object_out_of_bounds"
+            elif timed_out:
+                if self.is_panda and self.stage[index] <= 2:
+                    self.termination_reason[index] = "grasp_failed_or_timeout"
+                elif self.definition.mode == "panda_peg_insert":
+                    self.termination_reason[index] = "insertion_jam_or_timeout"
+                else:
+                    self.termination_reason[index] = "timeout"
         self.last_reward = (
             self.definition.progress_scale * progress
-            - 0.01 * np.sum(action_array**2, axis=1)
+            - 0.002 * np.sum(action_array**2, axis=1)
             + self.success.astype(np.float32)
         ).astype(np.float32)
         self.previous_distance = distance
@@ -360,6 +768,27 @@ class EmbodiedTask:
         if self.object_qpos_adr is not None:
             return self._object_positions()
         return self._body_positions()[:, self.agent_body_id, :]
+
+    def _task_distance(self, position: np.ndarray) -> np.ndarray:
+        if self.is_panda:
+            return np.linalg.norm(position - self.goal, axis=1).astype(np.float32)
+        return np.linalg.norm(position[:, :2] - self.goal[:, :2], axis=1).astype(np.float32)
+
+    def _success_condition(self, position: np.ndarray, distance: np.ndarray) -> np.ndarray:
+        if self.definition.mode == "panda_pick_place":
+            return (
+                (self.stage >= 6)
+                & (distance < self.definition.goal_radius)
+                & (position[:, 2] < 0.15)
+            )
+        if self.definition.mode == "panda_peg_insert":
+            horizontal = np.linalg.norm(position[:, :2] - self.goal[:, :2], axis=1)
+            return (
+                (self.stage >= 6)
+                & (horizontal < self.definition.goal_radius)
+                & (position[:, 2] < 0.125)
+            )
+        return distance < self.definition.goal_radius
 
     def _contacts_for_world(self, world_id: int) -> dict[str, Any]:
         count_total = int(self.data.nacon.numpy()[0])
@@ -396,19 +825,45 @@ class EmbodiedTask:
         body_quaternion = self.data.xquat.numpy()[0]
         body_wrench = self.data.cfrc_ext.numpy()[0]
         sim_time = float(self.data.time.numpy()[0])
+        joint_position = qpos[self.controlled_qpos_adr]
+        joint_velocity = qvel[self.controlled_dof_adr]
+        try:
+            joint_effort = self.data.qfrc_actuator.numpy()[0, self.controlled_dof_adr]
+        except (AttributeError, IndexError):
+            joint_effort = np.zeros(len(self.controlled_dof_adr), dtype=np.float32)
+        if self.end_effector_site_id >= 0:
+            end_effector_position = self.data.site_xpos.numpy()[0, self.end_effector_site_id]
+            site_matrix = np.asarray(
+                self.data.site_xmat.numpy()[0, self.end_effector_site_id], dtype=np.float64
+            ).reshape(9)
+            end_effector_quaternion = np.zeros(4, dtype=np.float64)
+            mujoco.mju_mat2Quat(end_effector_quaternion, site_matrix)
+        else:
+            end_effector_position = body_position[self.agent_body_id]
+            end_effector_quaternion = body_quaternion[self.agent_body_id]
+        gripper_width = float(np.sum(joint_position[-2:])) if self.is_panda else 0.0
         return {
             "frame_id": self.frame_id,
             "sim_time": sim_time,
             "scenario_id": self.task_name,
+            "robot_id": self.robot.robot_id,
             "qpos": qpos.tolist(),
             "qvel": qvel.tolist(),
+            "joint_position": joint_position.tolist(),
+            "joint_velocity": joint_velocity.tolist(),
+            "joint_effort": np.asarray(joint_effort, dtype=np.float32).tolist(),
+            "end_effector_position": np.asarray(end_effector_position, dtype=np.float32).tolist(),
+            "end_effector_quaternion": np.asarray(end_effector_quaternion, dtype=np.float32).tolist(),
+            "gripper_width": gripper_width,
             "body_position": body_position.tolist(),
             "body_quaternion": body_quaternion.tolist(),
             "body_external_wrench": body_wrench.tolist(),
             "action": self.last_action[0].tolist(),
+            "action_command": self.last_action_command[0].tolist(),
             "reward": float(self.last_reward[0]),
             "terminated": bool(self.terminated[0]),
             "success": bool(self.success[0]),
+            "termination_reason": str(self.termination_reason[0]),
             "goal_position": self.goal[0].tolist(),
             "task_stage": int(self.stage[0]),
             "distance_to_goal": float(self.previous_distance[0]),
@@ -422,6 +877,31 @@ class EmbodiedTask:
             },
         }
 
+    def episode_metadata(self) -> dict[str, Any]:
+        return {
+            "robot": {
+                "id": self.robot.robot_id,
+                "display_name": self.robot.display_name,
+                "controlled_joint_names": list(self.robot.controlled_joints),
+                "gripper_joint_names": list(self.robot.gripper_joint_names),
+                "end_effector_body": self.robot.end_effector_body,
+                "end_effector_site": self.robot.end_effector_site or "",
+                "model_source": self.robot.model_source,
+                "model_license": self.robot.model_license,
+            },
+            "action_spec": {
+                "type": self.robot.control_mode,
+                "names": list(self.robot.action_names),
+                "units": list(self.robot.action_units),
+                "normalized_low": [-1.0] * self.action_dim,
+                "normalized_high": [1.0] * self.action_dim,
+                "command_low": self.action_command_low.astype(float).tolist(),
+                "command_high": self.action_command_high.astype(float).tolist(),
+                "control_hz": 1.0 / CONTROL_DT,
+            },
+            "randomization": self.randomization,
+        }
+
     def model_spec(self) -> dict[str, Any]:
         geom_types = {
             int(mujoco.mjtGeom.mjGEOM_PLANE): "plane",
@@ -429,6 +909,7 @@ class EmbodiedTask:
             int(mujoco.mjtGeom.mjGEOM_CAPSULE): "capsule",
             int(mujoco.mjtGeom.mjGEOM_BOX): "box",
             int(mujoco.mjtGeom.mjGEOM_CYLINDER): "cylinder",
+            int(mujoco.mjtGeom.mjGEOM_MESH): "mesh",
         }
         bodies = [
             {
@@ -443,6 +924,29 @@ class EmbodiedTask:
             geom_type = geom_types.get(geom_type_id)
             if geom_type is None:
                 continue
+            vertices: list[list[float]] | None = None
+            triangles: list[int] | None = None
+            if geom_type == "mesh":
+                if int(self.mj_model.geom_group[geom_id]) != 3:
+                    continue
+                mesh_id = int(self.mj_model.geom_dataid[geom_id])
+                if mesh_id < 0:
+                    continue
+                vertex_start = int(self.mj_model.mesh_vertadr[mesh_id])
+                vertex_count = int(self.mj_model.mesh_vertnum[mesh_id])
+                face_start = int(self.mj_model.mesh_faceadr[mesh_id])
+                face_count = int(self.mj_model.mesh_facenum[mesh_id])
+                vertices = np.asarray(
+                    self.mj_model.mesh_vert[vertex_start : vertex_start + vertex_count],
+                    dtype=np.float32,
+                ).tolist()
+                triangles = np.asarray(
+                    self.mj_model.mesh_face[face_start : face_start + face_count],
+                    dtype=np.int32,
+                ).reshape(-1).tolist()
+            rgba = np.asarray(self.mj_model.geom_rgba[geom_id], dtype=np.float32).copy()
+            if geom_type == "mesh" and rgba[3] < 0.1:
+                rgba = np.asarray([0.55, 0.58, 0.62, 1.0], dtype=np.float32)
             geoms.append(
                 {
                     "id": geom_id,
@@ -452,7 +956,9 @@ class EmbodiedTask:
                     "size": np.asarray(self.mj_model.geom_size[geom_id], dtype=np.float32).tolist(),
                     "position": np.asarray(self.mj_model.geom_pos[geom_id], dtype=np.float32).tolist(),
                     "quaternion": np.asarray(self.mj_model.geom_quat[geom_id], dtype=np.float32).tolist(),
-                    "rgba": np.asarray(self.mj_model.geom_rgba[geom_id], dtype=np.float32).tolist(),
+                    "rgba": rgba.tolist(),
+                    "vertices": vertices,
+                    "triangles": triangles,
                 }
             )
         return {
@@ -464,10 +970,11 @@ class EmbodiedTask:
             "official_reference": self.definition.official_reference,
             "physics_dt": PHYSICS_DT,
             "control_dt": CONTROL_DT,
-            "max_frames": MAX_FRAMES,
+            "max_frames": self.definition.max_frames,
             "goal_radius": self.definition.goal_radius,
             "camera_position": list(self.definition.camera_position),
             "camera_look_at": list(self.definition.camera_look_at),
+            "robot": self.episode_metadata()["robot"],
             "bodies": bodies,
             "geoms": geoms,
         }

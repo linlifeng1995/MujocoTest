@@ -11,7 +11,7 @@ namespace MJWarpDemo
 {
     public sealed class MjWarpClient : IDisposable
     {
-        public const int ProtocolVersion = 1;
+        public const int ProtocolVersion = 3;
         private const int MaxMessageBytes = 64 * 1024 * 1024;
 
         private readonly SemaphoreSlim requestLock = new SemaphoreSlim(1, 1);

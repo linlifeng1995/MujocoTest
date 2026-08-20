@@ -30,11 +30,26 @@ namespace MJWarpDemo.Tests
         [Test]
         public void ScenarioCatalogContainsOneScenePerBusinessTask()
         {
-            Assert.That(MjWarpScenarioCatalog.All.Count, Is.EqualTo(4));
+            Assert.That(MjWarpScenarioCatalog.All.Count, Is.EqualTo(6));
             Assert.That(MjWarpScenarioCatalog.FindById("precision_insert").SceneName,
                 Is.EqualTo("PrecisionAssemblyScene"));
             Assert.That(MjWarpScenarioCatalog.FindById("warehouse_navigation").DisplayName,
                 Is.EqualTo("仓储移动机器人"));
+        }
+
+        [Test]
+        public void LearningPolicyProtocolUsesVersionTwo()
+        {
+            Assert.That(MjWarpClient.ProtocolVersion, Is.EqualTo(3));
+            var model = new ModelArtifactInfo
+            {
+                artifact_id = "planar_push/bc_test",
+                scenario = "planar_push",
+                model_type = "behavior_cloning",
+                action_dim = 2,
+            };
+            Assert.That(model.action_dim, Is.EqualTo(2));
+            Assert.That(model.artifact_id, Does.StartWith("planar_push/"));
         }
     }
 }

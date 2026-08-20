@@ -40,25 +40,45 @@ def test_recorder_writes_valid_aligned_episode(tmp_path: Path) -> None:
     width, height = 4, 3
     rgba = np.zeros((height, width, 4), dtype=np.uint8)
     depth = np.ones((height, width), dtype="<f4")
-    capture = {
-        "frame_id": 1,
+    initial_capture = {
+        "frame_id": 0,
+        "initial": True,
         "rgb_b64": base64.b64encode(rgba.tobytes()).decode(),
         "depth_b64": base64.b64encode(depth.tobytes()).decode(),
         "instance_b64": base64.b64encode(rgba.tobytes()).decode(),
     }
+    capture = {**initial_capture, "frame_id": 1, "initial": False}
     recorder = EpisodeRecorder(
         tmp_path,
         "episode",
-        {"task_name": "precision_insert", "seed": 1, "policy": "expert"},
+        {
+            "task_name": "precision_insert",
+            "seed": 1,
+            "policy": "expert",
+            "physics_dt": 0.002,
+            "control_dt": 0.05,
+            "protocol_version": 3,
+            "robot": {"id": "test_robot"},
+            "action_spec": {"type": "test"},
+            "randomization": {"randomization_group": "test-01"},
+            "camera_metadata": {"front": {"width": width, "height": height}},
+            "data_source": "synthetic_simulation",
+            "generation_strategy": "expert",
+            "license_manifest": "test-license",
+        },
         width,
         height,
     )
-    recorder.append_capture(_state(1), capture)
+    recorder.append_initial(_state(0), initial_capture)
+    recorder.append_transition(_state(1), capture)
     path = recorder.close(False)
     assert validate_file(path) == []
     with h5py.File(path, "r") as episode:
-        assert episode["images/rgb"].shape == (1, height, width, 3)
-        assert episode["observations/goal_position"].shape == (1, 3)
-        assert episode.attrs["schema_version"] == "1.1"
+        assert episode["images/front_rgb"].shape == (2, height, width, 3)
+        assert episode["images/wrist_rgb"].shape == (2, height, width, 3)
+        assert episode["observations/goal_position"].shape == (2, 3)
+        assert episode["actions/normalized"].shape == (1, 2)
+        assert episode.attrs["schema_version"] == "2.0"
         assert episode.attrs["task_name"] == "precision_insert"
-        assert episode.attrs["frame_count"] == 1
+        assert episode.attrs["frame_count"] == 2
+        assert episode.attrs["transition_count"] == 1

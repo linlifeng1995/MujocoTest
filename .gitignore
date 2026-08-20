@@ -38,6 +38,8 @@ External/MJWarpDemo/.python-version
 # Generated datasets and logs
 Datasets/
 BackendLogs/
+Artifacts/
+Delivery/
 *.h5
 *.partial
 

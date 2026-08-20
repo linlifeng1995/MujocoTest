@@ -57,6 +57,18 @@ namespace MJWarpDemo
                 "仓储移动机器人",
                 "AMR 路径规划与避障",
                 "移动底盘穿过货架通道到达随机库位。"),
+            new MjWarpScenarioInfo(
+                "PandaPickPlaceScene",
+                "panda_pick_place",
+                "Panda 抓取放置",
+                "标准单臂抓放与数据交付",
+                "Franka Panda 抓取随机方块并放入目标料盒。"),
+            new MjWarpScenarioInfo(
+                "PandaPegInsertScene",
+                "panda_peg_insert",
+                "Panda 精密插入",
+                "接触型装配与插入",
+                "Franka Panda 抓取带法兰定位销并插入随机孔位。"),
         };
 
         public static IReadOnlyList<MjWarpScenarioInfo> All => scenarios;
